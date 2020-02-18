@@ -223,18 +223,46 @@ module MakeSolver(Ctx : Syntax.Context) (Var : Transition.Var) (Ltr : Letter wit
      R is applied to the same sequence of variables
    *)
   let reduce_vars solver =
-    let module G = Graph.Imperative.Digraph.ConcreteBidirectionalLabeled(struct
-                                                                          type t = int
-                                                                          let compare x y = x - y
-                                                                          let hash = Hashtbl.hash
-                                                                          let equal x y = (compare x y) = 0
-                                                                        end)
-                                                                        (struct
-                                                                          type t = bool * Transition.t [@@deriving ord]
-                                                                          let default = (true, Transition.one)
-                                                                        end)
+    (* Translate the Srk.Transition module into one that satisfies the Srk.VarAnalysis.Transition requirements *)
+    let module Var = struct
+      include Var
+      module Set = BatSet.Make(Var)
+     end
     in
-    let module VS = BatSet.Make(Var) in
+    let module Trans = struct
+      module T = Transition
+      include T
+
+      let guards trans =
+        Symbol.Set.fold (fun sym vars ->
+          match Var.of_symbol sym with
+          | Some v -> v :: vars
+          | _ -> vars
+        ) (symbols (T.guard trans)) []
+
+      let defines trans = T.defines trans
+
+      let havocs trans =
+        BatEnum.fold (fun vars (var, exp) ->
+          match destruct Ctx.context exp with
+          | `App (sym, []) ->
+            begin
+              match Var.of_symbol sym with
+              | None when not (Symbol.Set.mem sym (symbols (T.guard trans))) -> var :: vars
+              | _ -> vars
+            end
+          | _ -> vars
+        ) [] (T.transform trans)
+
+      let uses trans var =
+        Symbol.Set.fold (fun sym vars ->
+          match Var.of_symbol sym with
+          | Some v -> v :: vars
+          | _ -> vars
+        ) (symbols (T.get_transform var trans)) []
+     end
+    in
+    (* Function to translate from preds / expressions to locations / variables *)
     (* Turn a predicate into a location (int) *)
     let to_loc =
       let next_loc : int ref = ref (-1) in
@@ -244,126 +272,66 @@ module MakeSolver(Ctx : Syntax.Context) (Var : Transition.Var) (Ltr : Letter wit
     let vars_of expr =
       Symbol.Set.fold (fun sym vars ->
           match Var.of_symbol sym with
-          | Some v -> VS.add v vars
+          | Some v -> Var.Set.add v vars
           | None -> vars
-        ) (symbols expr) VS.empty
+        ) (symbols expr) Var.Set.empty
     in
-    (* A worklist algorithm paramatized on graph, queue of initial elements,
-       the function to compute, and the set of "next" processed by f *)
-    let worklist g q f next =
-      while not (Queue.is_empty q) do
-        let v = Queue.pop q in
-        List.iter (fun adj ->
-            f q v adj
-          ) (next g v)
-      done
+    (* Translate Hoare Triples into VarAnalysis constraint graph *)
+    let module VA = VarAnalysis.Make(Var)(Trans) in
+    let va = VA.mk_empty () in
+    let add_vars pred =
+      match destruct srk pred with
+      | `App _ -> VA.set_max_vars va (to_loc pred) (Var.Set.to_list (vars_of pred))
+      | _ -> VA.set_vars va (to_loc pred) (Var.Set.to_list (vars_of pred))
     in
-    (* construct graph *)
-    let g = G.create () in
     DA.iter (fun (pres, letter, posts) ->
-        let pre = to_loc (mk_and pres) in
-        let trans = Ltr.transition_of letter in
-        let pres = List.map to_loc pres in
-        let posts = List.map to_loc posts in
-        (match pres with
-         | _ :: _ :: _ -> List.iter (fun pred -> G.add_edge g pred pre) pres
-         | _ -> ());
-        List.iter (fun post ->
-            G.add_edge_e g (G.E.create pre (false, trans) post)
-          ) posts
-      ) solver.triples;
-    (* Which variables do we want to at most consider per location *)
-    let max_vars = DA.init (G.nb_vertex g) (fun _ -> VS.empty) in
-    let vars = DA.init (G.nb_vertex g) (fun _ -> VS.empty) in
-    DA.iter (fun (pre, _, post) ->
-        List.iter (fun pred ->
-            match destruct srk pred with
-            | `App _ when (VS.is_empty (DA.get max_vars (to_loc pred))) ->
-               DA.set max_vars (to_loc pred) (vars_of pred)
-            | `App _ -> ()
-            | _ ->
-               begin (* this is needed if we have constraints on variables 
-                        for the forward analysis step *)
-                 DA.set max_vars (to_loc pred) (vars_of pred);
-                 DA.set vars (to_loc pred) (vars_of pred)
-               end
-          ) (List.append pre post);
-        let pre = mk_and pre in
-        DA.set max_vars (to_loc pre) (vars_of pre)
-      ) solver.triples;
-    (* Backwards slice analysis definitions (results in vars after worklist) *)
-    let do_slice q v adj =
-      let get_slice (_, trans) vars =
-        VS.fold (fun var vars ->
-            if Transition.mem_transform var trans then
-              VS.union (vars_of (Transition.get_transform var trans)) vars
-            else
-              VS.add var vars
-          ) vars (vars_of (Transition.guard trans))
-      in
-      let src = G.E.src adj in
-      let slice = VS.inter (get_slice (G.E.label adj) (DA.get vars v))
-                           (DA.get max_vars src)
-      in
-      if not (VS.subset slice (DA.get vars src)) then
-        begin
-          DA.set vars src (VS.union slice (DA.get vars src));
-          Queue.add src q
-        end
+      let pre = mk_and pres in
+      let pre_loc = to_loc pre in
+      VA.add_vertex va pre_loc;
+      VA.set_pooling va pre_loc true;
+      (match pres with
+       | _ :: _ :: _ ->
+         VA.set_max_vars va pre_loc (Var.Set.to_list (vars_of pre));
+         List.iter (fun pred ->
+           VA.add_vertex va (to_loc pred);
+           add_vars pred;
+           VA.add_edge va (to_loc pred) Transition.one pre_loc
+         ) pres
+       | _ ->
+         VA.set_pooling va pre_loc false;
+         add_vars pre
+      );
+      List.iter (fun post ->
+        VA.add_vertex va (to_loc post);
+        add_vars post;
+        VA.add_edge va pre_loc (Ltr.transition_of letter) (to_loc post)
+      ) posts
+    ) solver.triples;
+    let new_vars pred =
+      let vars = VA.havoc_live_vars va in
+      vars (to_loc pred)
     in
-    (* End backwards slice analysis definitions *)
-    (* Defined variables forward analysis (starting from vars) result in vars after worklist *)
-    let forward q _ adj =
-      let get_defined (_, trans) vars =
-        BatEnum.fold (fun vars (var, expr) ->
-            VS.union (VS.add var vars) (vars_of expr)
-          ) vars (Transition.transform trans)
-      in
-      let get_defined v =
-        match G.E.label adj with
-        | (true, _) ->
-           List.fold_left (fun defs adj ->
-               VS.union defs (get_defined (G.E.label adj) (DA.get vars (G.E.src adj)))
-             ) VS.empty (G.pred_e g v)
-        | _ -> VS.inter (DA.get vars v) (get_defined (G.E.label adj) (DA.get vars (G.E.src adj)))
-      in
-      let v = G.E.dst adj in
-      let defined = get_defined v in
-      if VS.subset defined (DA.get vars v) then
-        begin
-          DA.set vars v defined;
-          Queue.add v q
-        end
-    in
-    (* End Defined variables forward analysis *)
-    let q = Queue.create () in
-    Queue.add (to_loc Ctx.mk_false) q;
-    worklist g q do_slice G.pred_e;
-    (* Add all vertices to ensure all vertices are processed *)
-    G.iter_vertex (fun v -> Queue.add v q) g;
-    worklist g q forward G.succ_e;
     let trips =
       let f =
         Memo.memo (fun pred ->
-            let get_pred var_types = Ctx.mk_symbol (`TyFun (var_types, `TyBool)) in
-            match destruct srk pred with
-            | `App _ ->
-               begin
-                 let vars = VS.to_list (DA.get vars (to_loc pred)) in
-                 let vars_type = List.map (fun v -> (Var.typ v :> typ_fo)) vars in
-                 let vars_const = List.map (fun var -> Ctx.mk_const (Var.symbol_of var)) vars in
-                 Ctx.mk_app (get_pred vars_type) vars_const
-               end
-            | _ -> pred
-          )
+          let get_pred var_types = Ctx.mk_symbol (`TyFun (var_types, `TyBool)) in
+          match destruct srk pred with
+          | `App _ ->
+            begin
+              let vars = new_vars pred in
+              let vars_type = List.map (fun v -> (Var.typ v :> typ_fo)) vars in
+              let vars_const = List.map (fun v -> Ctx.mk_const (Var.symbol_of v)) vars in
+              Ctx.mk_app (get_pred vars_type) vars_const
+            end
+          | _ -> pred
+        )
       in
       DA.map (fun (pre, letter, post) ->
-          let pre = List.map f pre in
-          let post = List.map f post in
-          (pre, letter, post)
-        ) solver.triples
+        let pre = List.map f pre in
+        let post = List.map f post in
+        (pre, letter, post)
+      ) solver.triples
     in
-    (* DA.iter (fun trip -> logf ~level:`always "%a" pp_triple trip) solver.triples; *)
     DA.blit trips 0 solver.triples 0 (DA.length trips)
-    (* DA.iter (fun trip -> logf ~level:`always "%a" pp_triple trip) solver.triples *)
+
 end

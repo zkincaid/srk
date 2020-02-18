@@ -220,7 +220,7 @@ module Make(V : Var)(T : Trans with type var = V.t) = struct
   let havoc_live_vars va =
     let vars = live_vars va in
     havoc_vars' va (fun v ->
-      if G.in_degree va.g v = 0 then
+      if (G.in_degree va.g v = 0) && (not (HT.mem va.vars v)) then
         []
       else
         (vars v)
