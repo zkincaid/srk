@@ -45,7 +45,7 @@ module MakeSolver(Ctx : Syntax.Context) (Var : Transition.Var) (Ltr : Letter wit
     fprintf formatter "}"
 
   type t = {
-      solver : Ctx.t CHC.solver;
+      mutable solver : Ctx.t CHC.solver;
       triples : triple DA.t;
     }
 
@@ -118,8 +118,7 @@ module MakeSolver(Ctx : Syntax.Context) (Var : Transition.Var) (Ltr : Letter wit
       let rec subst =
         let rewriter expr =
           match destruct srk expr with
-          | `App (_, []) -> expr
-          | `App (rel, args) ->
+          | `App (rel, args) when (match (typ_symbol srk rel) with | `TyFun _ -> true | _ -> false) ->
              (substitute srk
                 (fun v -> List.nth args v)
                 (CHC.get_solution solver.solver rel) :> ('a, typ_fo) Syntax.expr)
@@ -332,6 +331,8 @@ module MakeSolver(Ctx : Syntax.Context) (Var : Transition.Var) (Ltr : Letter wit
         (pre, letter, post)
       ) solver.triples
     in
-    DA.blit trips 0 solver.triples 0 (DA.length trips)
+    DA.clear solver.triples;
+    solver.solver <- CHC.mk_solver srk;
+    DA.iter (fun trip -> register_triple solver trip) trips
 
 end
