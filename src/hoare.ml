@@ -287,7 +287,6 @@ module MakeSolver(Ctx : Syntax.Context) (Var : Transition.Var) (Ltr : Letter wit
       let pre = mk_and pres in
       let pre_loc = to_loc pre in
       VA.add_vertex va pre_loc;
-      VA.set_pooling va pre_loc true;
       (match pres with
        | _ :: _ :: _ ->
          VA.set_max_vars va pre_loc (Var.Set.to_list (vars_of pre));
@@ -297,7 +296,6 @@ module MakeSolver(Ctx : Syntax.Context) (Var : Transition.Var) (Ltr : Letter wit
            VA.add_edge va (to_loc pred) Transition.one pre_loc
          ) pres
        | _ ->
-         VA.set_pooling va pre_loc false;
          add_vars pre
       );
       List.iter (fun post ->

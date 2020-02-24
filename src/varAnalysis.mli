@@ -11,7 +11,6 @@ module type S = sig
 
   val set_vars : t -> vertex -> var list -> unit
   val set_max_vars : t -> vertex -> var list -> unit
-  val set_pooling : t -> vertex -> bool -> unit
 
   val live_vars : t -> (vertex -> var list)
   val havoc_vars : t -> (vertex -> var list)
