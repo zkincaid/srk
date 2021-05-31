@@ -99,7 +99,7 @@ let assert_equiv_formula s t =
 let assert_equiv_quantified_formula s t =
   assert_equal
     ~printer:(Formula.show srk)
-    ~cmp:(fun x y -> Quantifier.simsat srk (mk_not srk (mk_iff srk x y)) = `Unsat) s t
+    ~cmp:(fun x y -> Quantifier.CoarseGrainStrategyImprovement.simsat srk (mk_not srk (mk_iff srk x y)) = `Unsat) s t
 
 let assert_equal_qq x y =
   assert_equal ~printer:QQ.show ~cmp:QQ.equal x y

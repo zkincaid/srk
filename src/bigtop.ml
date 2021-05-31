@@ -75,7 +75,7 @@ let spec_list = [
   ("-simsat",
    Arg.String (fun file ->
        let phi = load_formula file in
-       print_result (Quantifier.simsat srk phi)),
+       print_result (Quantifier.CoarseGrainStrategyImprovement.simsat_forward srk phi)),
    " Test satisfiability of an LRA or LIA formula (IJCAI'16)");
 
   ("-nlsat",
