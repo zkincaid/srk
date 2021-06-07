@@ -87,11 +87,11 @@ module Make(G : G) = struct
                go SubG.{ vertices = VertexSet.remove header body;
                          graph = g.graph }
              in
-             (`Loop { header; children; body })::loops)
+             (`Loop { header; children = List.rev children; body })::loops)
         []
-        (SCC.scc_list g)
+        (List.rev (SCC.scc_list g))
     in
-    go (promote g)
+    List.rev (go (promote g))
 
     (*
   let steensgaard g =
