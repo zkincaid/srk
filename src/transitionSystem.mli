@@ -25,9 +25,9 @@ module Make
        type var = Var.t
        val pp : Format.formatter -> t -> unit
        val guard : t -> C.t formula
-       val transform : t -> (var * C.t term) BatEnum.t
+       val transform : t -> (var * C.t arith_term) BatEnum.t
        val mem_transform : var -> t -> bool
-       val get_transform : var -> t -> C.t term
+       val get_transform : var -> t -> C.t arith_term
        val assume : C.t formula -> t
        val mul : t -> t -> t
        val add : t -> t -> t
@@ -63,6 +63,10 @@ module Make
   (** Over-approximate the sum of the weights of all paths between two given
       vertices.  *)
   val call_weight : query -> (vertex * vertex) -> transition
+
+  (** Over-approximate the sum of the weights of all infinite paths
+     starting at a given vertex. *)
+  val omega_path_weight : query -> (transition,'b) Pathexpr.omega_algebra -> 'b
 
   (** Project out local variables from each transition that are referenced
       only by that transition. *)

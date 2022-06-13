@@ -4,7 +4,7 @@ open Syntax
 module type PreDomain = sig
   type 'a t
   val pp : 'a context -> (symbol * symbol) list -> Format.formatter -> 'a t -> unit
-  val exp : 'a context -> (symbol * symbol) list -> 'a term -> 'a t -> 'a formula
+  val exp : 'a context -> (symbol * symbol) list -> 'a arith_term -> 'a t -> 'a formula
   val abstract : 'a context -> 'a TransitionFormula.t -> 'a t
 end
 
@@ -45,7 +45,12 @@ module LinearGuard : PreDomainIter
 (** Abstract a transition formula F(x,x') by a system of recurrences of the form
     a(x') >= a(x) + c
     where a is a linear map and c is a scalar. *)
-module LinearRecurrenceInequation : PreDomain
+module LossyTranslation : PreDomain
+
+(** Abstract a transition formula F(x,x') a translation 
+      a(x') = a(x) + c
+    guarded by a LIA formula *)
+module GuardedTranslation : PreDomain
 
 (** Abstract a transition formula F(x,x',y) (where y denotes a set of
    symbolic constants) by a system of recurrences of the form
@@ -71,3 +76,17 @@ module ProductWedge (A : PreDomainWedge) (B : PreDomainWedge) : PreDomainWedge
   with type 'a t = 'a A.t * 'a B.t
 
 module MakeDomain(Iter : PreDomain) : Domain
+
+(** Given a transition formula T and a transition predicate p, we say
+   that p is an invariant of T if T(x,x') /\ T(x',x'') is consistent and
+     T(x,x') /\ T(x',x'') /\ p(x,x') => p(x',x'')
+   A set of transition predicates defines a partition of T, which is acyclic
+   in the sense that when a computation leaves a cell it may never return.
+   This function takes a set of candidate transition predicates, a transition formula,
+   and a mortal precondition operator and returns another mortal precondition
+   via analyzing the phase transition structure of the transition formula. *)
+val phase_mp : 'a context -> 
+               ('a formula) list ->
+               'a TransitionFormula.t ->
+               ('a TransitionFormula.t -> 'a formula) ->
+               'a formula

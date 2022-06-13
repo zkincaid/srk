@@ -11,6 +11,8 @@ type quantifier_prefix = ([`Forall | `Exists] * symbol) list
 module V = Linear.QQVector
 module VS = BatSet.Make(Linear.QQVector)
 module VM = BatMap.Make(Linear.QQVector)
+module ZZVector = Linear.ZZVector
+module IntSet = SrkUtil.Int.Set
 
 let substitute_const srk sigma expr =
   let simplify t = of_linterm srk (linterm_of srk t) in
@@ -20,19 +22,19 @@ let substitute_const srk sigma expr =
         begin
           try
             match Formula.destruct srk phi with
-            | `Atom (`Eq, s, t) ->
+            | `Atom (`Arith (`Eq, s, t)) ->
               (mk_eq srk (simplify s) (simplify t) :> ('a, typ_fo) expr)
-            | `Atom (`Leq, s, t) ->
+            | `Atom (`Arith (`Leq, s, t)) ->
               (mk_leq srk (simplify s) (simplify t) :> ('a, typ_fo) expr)
-            | `Atom (`Lt, s, t) ->
+            | `Atom (`Arith (`Lt, s, t)) ->
               (mk_lt srk (simplify s) (simplify t) :> ('a, typ_fo) expr)
             | `Proposition (`App (k, [])) ->
               (sigma k :> ('a, typ_fo) expr)
             | _ -> expr
           with Nonlinear -> expr
         end
-      | `Term t ->
-        begin match Term.destruct srk t with
+      | `ArithTerm t ->
+        begin match ArithTerm.destruct srk t with
           | `App (k, []) -> (sigma k :> ('a, typ_fo) expr)
           | `Binop (`Mod, s, t) ->
             begin
@@ -41,7 +43,8 @@ let substitute_const srk sigma expr =
               with Nonlinear -> expr
             end
           | _ -> expr
-        end)
+        end
+      | `ArrTerm _ -> assert false)
     expr
 
 (* Compute the GCD of all coefficients in an affine term (with integral
@@ -60,15 +63,16 @@ let common_denominator term =
     ZZ.one
     (V.enum term)
 
-let map_atoms srk f phi =
+let map_arith_atoms srk f phi =
   let rewriter expr =
     match Expr.refine srk expr with
     | `Formula phi ->
       begin match Formula.destruct srk phi with
-        | `Atom (op, s, t) -> (f op s t :> ('a, typ_fo) expr)
+        | `Atom (`Arith (op, s, t)) -> (f op s t :> ('a, typ_fo) expr)
         | _ -> expr
       end
-    | `Term _ -> expr
+    | `ArithTerm _ 
+    | `ArrTerm _ -> expr
   in
   rewrite srk ~up:rewriter phi
 
@@ -113,7 +117,7 @@ let virtual_substitution srk x virtual_term phi =
     V.pivot (dim_of_sym x) (linterm_of srk term)
   in
   let replace_atom op s zero =
-    assert (Term.equal zero (mk_real srk QQ.zero));
+    assert (ArithTerm.equal zero (mk_real srk QQ.zero));
 
     (* s == s' + ax, x not in fv(s') *)
     let (a, s') = pivot_term x s in
@@ -161,7 +165,7 @@ let virtual_substitution srk x virtual_term phi =
           (* -oo = x < -s'/a <==> true *)
           mk_true srk
   in
-  map_atoms srk replace_atom phi
+  map_arith_atoms srk replace_atom phi
 
 (* Model based projection, as in described in Anvesh Komuravelli, Arie
    Gurfinkel, Sagar Chaki: "SMT-based Model Checking for Recursive Programs".
@@ -193,7 +197,8 @@ let mbp_virtual_term srk interp x atoms =
   let get_vt atom =
     match Interpretation.destruct_atom srk atom with
     | `Literal (_, _) -> None
-    | `Comparison (op, s, t) ->
+    | `ArrEq _ -> None
+    | `ArithComparison (op, s, t) ->
       let t =
         try V.add (linterm_of srk s) (V.negate (linterm_of srk t))
         with Nonlinear -> assert false
@@ -236,20 +241,20 @@ let mbp_virtual_term srk interp x atoms =
    - psi is negation- and quantifier-free formula, and contains no free
      variables
    - every atom of in psi is either a propositial variable or an arithmetic
-     atom of the form t < 0, t <= 0, or t = 0
+     atom of the form t < 0, t <= 0, or t = 0 or array equality 
    - phi is equivalent to Q0 a0.Q1 a1. ... Qn. an. psi
 *)
 let normalize srk phi =
   let phi = Formula.prenex srk phi in
   let zero = mk_real srk QQ.zero in
   let rewriter env expr =
-    match Expr.refine srk expr with
+    match Expr.refine_coarse srk expr with
     | `Formula phi ->
       (begin match Formula.destruct srk phi with
          | `Proposition (`Var i) -> mk_const srk (Env.find env i)
-         | `Atom (`Eq, s, t) -> mk_eq srk (mk_sub srk s t) zero
-         | `Atom (`Leq, s, t) -> mk_leq srk (mk_sub srk s t) zero
-         | `Atom (`Lt, s, t) -> mk_lt srk (mk_sub srk s t) zero
+         | `Atom (`Arith (`Eq, s, t)) -> mk_eq srk (mk_sub srk s t) zero
+         | `Atom (`Arith (`Leq, s, t)) -> mk_leq srk (mk_sub srk s t) zero
+         | `Atom (`Arith (`Lt, s, t)) -> mk_lt srk (mk_sub srk s t) zero
          | _ -> phi
        end :> ('a, typ_fo) expr)
     | `Term t ->
@@ -275,7 +280,7 @@ let normalize srk phi =
 let simplify_atom srk op s t =
   let zero = mk_real srk QQ.zero in
   let destruct_int term =
-    match Term.destruct srk term with
+    match ArithTerm.destruct srk term with
     | `Real q ->
       begin match QQ.to_zz q with
         | Some z -> z
@@ -285,7 +290,7 @@ let simplify_atom srk op s t =
   in
   let (s, op) =
     let s =
-      if Term.equal t zero then s
+      if ArithTerm.equal t zero then s
       else mk_sub srk s t
     in
     match op with
@@ -307,14 +312,14 @@ let simplify_atom srk op s t =
   in
   match op with
   | `Eq | `Leq ->
-    begin match Term.destruct srk s with
+    begin match ArithTerm.destruct srk s with
     | `Binop (`Mod, dividend, modulus) ->
       (* Divisibility constraint *)
       let modulus = destruct_int modulus in
       let (multiplier, lt) = zz_linterm dividend in
       `Divides (ZZ.mul multiplier modulus, lt)
     | `Unop (`Neg, s') ->
-      begin match Term.destruct srk s' with
+      begin match ArithTerm.destruct srk s' with
         | `Binop (`Mod, dividend, modulus) ->
           if op = `Leq then
             (* trivial *)
@@ -327,7 +332,7 @@ let simplify_atom srk op s t =
         | _ -> `CompareZero (op, snd (zz_linterm s))
       end
     | `Add [x; y] ->
-      begin match Term.destruct srk x, Term.destruct srk y with
+      begin match ArithTerm.destruct srk x, ArithTerm.destruct srk y with
         | `Real k, `Binop (`Mod, dividend, modulus)
         | `Binop (`Mod, dividend, modulus), `Real k when QQ.lt k QQ.zero && op = `Eq ->
           let (multiplier, lt) = zz_linterm dividend in
@@ -338,7 +343,7 @@ let simplify_atom srk op s t =
           else
             `CompareZero (op, snd (zz_linterm s))
         | `Real k, `Unop (`Neg, z) | `Unop (`Neg, z), `Real k when QQ.equal k QQ.one ->
-          begin match Term.destruct srk z with
+          begin match ArithTerm.destruct srk z with
             | `Binop (`Mod, dividend, modulus) ->
               let modulus = destruct_int modulus in
               let (multiplier, lt) = zz_linterm dividend in
@@ -350,7 +355,7 @@ let simplify_atom srk op s t =
     | _ -> `CompareZero (op, snd (zz_linterm s))
     end
   | `Lt ->
-    begin match Term.destruct srk s with
+    begin match ArithTerm.destruct srk s with
       | `Binop (`Mod, dividend, modulus) ->
         (* Indivisibility constraint: dividend % modulus < 0. *)
         let modulus = destruct_int modulus in
@@ -358,7 +363,7 @@ let simplify_atom srk op s t =
         `NotDivides (ZZ.mul multiplier modulus, lt)
 
       | `Unop (`Neg, s') ->
-        begin match Term.destruct srk s' with
+        begin match ArithTerm.destruct srk s' with
           | `Binop (`Mod, dividend, modulus) ->
             (* Indivisibility constraint: dividend % modulus > 0 *)
             let modulus = destruct_int modulus in
@@ -374,7 +379,8 @@ let is_presburger_atom srk atom =
   try
     begin match Interpretation.destruct_atom srk atom with
       | `Literal (_, _) -> true
-      | `Comparison (op, s, t) ->
+      | `ArrEq _ -> false
+      | `ArithComparison (op, s, t) ->
         ignore (simplify_atom srk op s t);
         true
     end
@@ -696,8 +702,9 @@ let select_real_term srk interp x atoms =
   let x_val = Interpretation.real interp x in
   let bound_of_atom atom =
     match Interpretation.destruct_atom srk atom with
-    | `Literal (_, _) -> (None, None)
-    | `Comparison (op, s, t) ->
+    | `Literal (_, _) 
+    | `ArrEq _ -> (None, None)
+    | `ArithComparison (op, s, t) ->
       let t = V.add (linterm_of srk s) (V.negate (linterm_of srk t)) in
 
       let (a, t') = V.pivot (dim_of_sym x) t in
@@ -754,6 +761,7 @@ let select_real_term srk interp x atoms =
      t)
 
 let select_int_term srk interp x atoms =
+  assert (typ_symbol srk x == `TyInt);
   let merge bound bound' =
     match bound, bound' with
     | (`Lower (s, s_val), `Lower (t, t_val)) ->
@@ -766,8 +774,8 @@ let select_int_term srk interp x atoms =
           `Upper (s, s_val)
         else
           `Upper (t, t_val)
-    | (`Upper (t, t_val), _) | (_, `Upper (t, t_val)) -> `Upper (t, t_val)
     | (`Lower (t, t_val), _) | (_, `Lower (t, t_val)) -> `Lower (t, t_val)
+    | (`Upper (t, t_val), _) | (_, `Upper (t, t_val)) -> `Upper (t, t_val)
     | `None, `None -> `None
   in
   let eval = evaluate_linterm (Interpretation.real interp) in
@@ -785,7 +793,8 @@ let select_int_term srk interp x atoms =
       (fun delta atom ->
          match Interpretation.destruct_atom srk atom with
          | `Literal (_, _) -> delta
-         | `Comparison (op, s, t) ->
+         | `ArrEq _ -> delta
+         | `ArithComparison (op, s, t) ->
            match simplify_atom srk op s t with
            | `Divides (divisor, t) | `NotDivides (divisor, t) ->
              let a = match QQ.to_zz (V.coeff (dim_of_sym x) t) with
@@ -810,7 +819,8 @@ let select_int_term srk interp x atoms =
   let bound_of_atom atom =
     match Interpretation.destruct_atom srk atom with
     | `Literal (_, _) -> `None
-    | `Comparison (op, s, t) ->
+    | `ArrEq _ -> `None
+    | `ArithComparison (op, s, t) ->
       match simplify_atom srk op s t with
       | `CompareZero (op, t) ->
         begin
@@ -990,6 +1000,20 @@ let specialize_floor_cube srk model cube =
 
        add_div_constraint divisor dividend';
        (replacement :> ('a,typ_fo) expr)
+    | `Binop (`Mod, t, m) ->
+       begin match destruct srk m with
+       | `Real m ->
+          let replacement =
+            mk_real srk (QQ.modulo (Interpretation.evaluate_term model t) m)
+          in
+          let m = match QQ.to_zz m with
+            | Some m -> m
+            | None -> assert false
+          in
+          add_div_constraint m (mk_sub srk t replacement);
+          (replacement :> ('a,typ_fo) expr)
+       | _ -> expr
+       end
     | _ -> expr
   in
   let cube' = List.map (rewrite srk ~up:replace_floor) cube in
@@ -1315,7 +1339,8 @@ let simsat_forward_core srk qf_pre phi =
     | `TyInt -> Skeleton.MInt (select_int_term srk model x atoms)
     | `TyReal -> Skeleton.MReal (select_real_term srk model x atoms)
     | `TyBool -> Skeleton.MBool (Interpretation.bool model x)
-    | `TyFun (_, _) -> assert false
+    | `TyFun (_, _) 
+    | `TyArr -> assert false
   in
 
   (* If the quantifier prefix leads with an existential, check satisfiability
@@ -1526,7 +1551,8 @@ let simsat_core srk qf_pre phi =
     | `TyInt -> Skeleton.MInt (select_int_term srk model x phi)
     | `TyReal -> Skeleton.MReal (select_real_term srk model x phi)
     | `TyBool -> Skeleton.MBool (Interpretation.bool model x)
-    | `TyFun (_, _) -> assert false
+    | `TyFun (_, _) 
+    | `TyArr -> assert false
   in
   match CSS.initialize_pair select_term srk qf_pre phi with
   | `Unsat -> `Unsat
@@ -1589,7 +1615,8 @@ let maximize_feasible srk phi t =
       | `TyInt -> Skeleton.MInt (select_int_term srk m x phi)
       | `TyReal -> Skeleton.MReal (select_real_term srk m x phi)
       | `TyBool -> Skeleton.MBool (Interpretation.bool m x)
-      | `TyFun (_, _) -> assert false
+      | `TyFun (_, _) 
+      | `TyArr -> assert false
   in
   CSS.max_improve_rounds := 1;
   let init =
@@ -1738,84 +1765,224 @@ let qe_mbp srk phi =
     qf_pre
     phi
 
+(* Given a set of dimensions to project and a set of equations, orient
+   the equations into a set rewrite rules of the form (a * x) -> t *)
+let _orient project eqs =
+  let simplify vec =
+    let gcd = (* GCD of coefficients *)
+      BatEnum.fold (fun gcd (a, _) -> ZZ.gcd gcd a) ZZ.zero (ZZVector.enum vec)
+    in
+    ZZVector.map (fun _ a -> ZZ.div a gcd) vec
+  in
+  (* Replace a*dim -> rhs in vec.  a must be positive. *)
+  let substitute (a, dim) rhs vec =
+    let (b,vec') = ZZVector.pivot dim vec in
+    if ZZ.equal ZZ.zero b then
+      vec
+    else
+      let lcm = ZZ.abs (ZZ.lcm a b) in
+      let rhs = ZZVector.scalar_mul (ZZ.div lcm a) rhs in
+      let vec' = ZZVector.scalar_mul (ZZ.div lcm b) vec' in
+      simplify (ZZVector.add rhs vec')
+  in
+  (* Simplify equations *)
+  let eqs =
+    eqs
+    |> List.map (fun vec ->
+           let den = common_denominator vec in
+           V.enum vec
+           /@ (fun (scalar, dim) ->
+             match QQ.to_zz (QQ.mul (QQ.of_zz den) scalar) with
+             | Some z -> (z, dim)
+             | None -> assert false)
+           |> ZZVector.of_enum
+           |> simplify)
+  in
+  let rec go eqs oriented =
+    (* Find orientation among all equations that minimizes the leading coefficient *)
+    let champion =
+      List.fold_left (fun champion vec ->
+          BatEnum.fold (fun champion (a, dim) ->
+              if  IntSet.mem dim project then
+                let candidate =
+                  if ZZ.lt a ZZ.zero then
+                    Some (ZZ.negate a, dim, snd (ZZVector.pivot dim vec))
+                  else
+                    Some (a, dim, ZZVector.negate (snd (ZZVector.pivot dim vec)))
+                in
+                match champion with
+                | Some (b, _, _) ->
+                   if ZZ.lt (ZZ.abs a) b then candidate
+                   else champion
+                | None -> candidate
+              else
+                champion)
+            champion
+            (ZZVector.enum vec))
+        None
+        eqs
+    in
+    match champion with
+    | Some (a, dim, rhs) ->
+       let reduced_eqs =
+         List.filter_map (fun vec ->
+             let vec' = substitute (a, dim) rhs vec in
+             if ZZVector.equal ZZVector.zero vec' then
+               None
+             else
+               Some vec')
+           eqs
+       in
+       go reduced_eqs ((a, dim, rhs)::oriented)
+    | None -> (List.rev oriented, eqs)
+  in
+  go eqs []
+
 let mbp ?(dnf=false) srk exists phi =
   let phi =
     eliminate_ite srk phi
     |> rewrite srk
-      ~down:(nnf_rewriter srk)
-      ~up:(SrkSimplify.simplify_terms_rewriter srk)
+         ~down:(nnf_rewriter srk)
+         ~up:(SrkSimplify.simplify_terms_rewriter srk)
   in
   let project =
     Symbol.Set.filter (not % exists) (symbols phi)
   in
-  let solver = Smt.mk_solver ~theory:"QF_LIRA" srk in
+  let project_int =
+    Symbol.Set.fold (fun s set ->
+        IntSet.add (Linear.dim_of_sym s) set)
+      project
+      IntSet.empty
+  in
+  let solver = Smt.mk_solver ~theory:"QF_LIA" srk in
   let disjuncts = ref [] in
   let is_true phi =
     match Formula.destruct srk phi with
     | `Tru -> true
     | _ -> false
   in
+  (* Sequentially compose [subst] with the substitution [symbol -> term] *)
+  let seq_subst symbol term subst =
+    let subst_symbol =
+      substitute_const srk
+        (fun s -> if s = symbol then term else mk_const srk s)
+    in
+    Symbol.Map.add symbol term (Symbol.Map.map subst_symbol subst)
+  in
   let rec loop () =
     match Smt.Solver.get_model solver with
     | `Sat interp ->
-      let implicant =
-        match select_implicant srk interp phi with
-        | Some x -> specialize_floor_cube srk interp x
-        | None -> assert false
-      in
-      let (vt_map, _) =
-        Symbol.Set.fold (fun s (vt_map, implicant) ->
-            let vt = select_int_term srk interp s implicant in
+       let implicant =
+         match select_implicant srk interp phi with
+         | Some x -> specialize_floor_cube srk interp x
+         | None -> assert false
+       in
+       (* Find substitutions for symbols involved in equations, along
+          with divisibility constarints *)
+       let (subst, div_constraints) =
+         let (oriented_eqs, _) =
+           List.filter_map (fun atom ->
+               match Interpretation.destruct_atom srk atom with
+               | `ArithComparison (op, s, t) ->
+                  begin match simplify_atom srk op s t with
+                  | `CompareZero (`Eq, t) -> Some t
+                  | _ -> None
+                  end
+               | _ -> None)
+             implicant
+           |> _orient project_int
+         in
+         List.fold_left (fun (subst, div_constraints) (a, dim, rhs) ->
+             let rhs_qq =
+               ZZVector.enum rhs
+               /@ (fun (b, dim) -> (QQ.of_zz b, dim))
+               |> V.of_enum
+             in
+             let sym = match Linear.sym_of_dim dim with
+               | Some s -> s
+               | None -> assert false
+             in
+             let sym_div = mk_divides srk a rhs_qq in
+             let rhs_term =
+               Linear.of_linterm srk
+                 (V.scalar_mul (QQ.of_zzfrac (ZZ.of_int 1) a) rhs_qq)
+             in
+             (seq_subst sym rhs_term subst, sym_div::div_constraints))
+           (Symbol.Map.empty, [])
+           oriented_eqs
+       in
+       let implicant =
+         List.map (substitute_map srk subst) (div_constraints@implicant)
+       in
+       (* Add substitituions for symbols *not* involved in equations
+          to subst *)
+       let subst =
+         Symbol.Set.fold (fun s (subst, implicant) ->
+             if Symbol.Map.mem s subst then
+               (* Skip symbols involved in equations *)
+               (subst, implicant)
+             else if typ_symbol srk s = `TyInt then
+               let vt = select_int_term srk interp s implicant in
 
-            (* floor(term/div) + offset ~> (term - ([[term]] mod div))/div + offset,
+               (* floor(term/div) + offset ~> (term - ([[term]] mod div))/div + offset,
                and add constraint that div | (term - ([[term]] mod div)) *)
-            let term_val =
-              let term_qq = evaluate_linterm (Interpretation.real interp) vt.term in
-              match QQ.to_zz term_qq with
-              | None -> assert false
-              | Some zz -> zz
-            in
-            let remainder =
-              Mpzf.fdiv_r term_val vt.divisor
-            in
-            let numerator =
-              V.add_term (QQ.of_zz (ZZ.negate remainder)) const_dim vt.term
-            in
-            let replacement =
-              V.scalar_mul (QQ.inverse (QQ.of_zz vt.divisor)) numerator
-              |> V.add_term (QQ.of_zz vt.offset) const_dim
-              |> of_linterm srk
-            in
-
-            let subst =
-              substitute_const srk
-                (fun p -> if p = s then replacement else mk_const srk p)
-            in
-            let divides = mk_divides srk vt.divisor numerator in
-            let implicant =
-              BatList.filter (not % is_true) (divides::(List.map subst implicant))
-            in
-            let subst' =
-              substitute_const srk
-                (fun p -> if p = s then replacement else mk_const srk p)
-            in
-            let vt_map = Symbol.Map.map subst' vt_map in
-            (Symbol.Map.add s (term_of_virtual_term srk vt) vt_map,
-             implicant))
-          project
-          (Symbol.Map.empty, implicant)
-      in
-      let disjunct =
-        substitute_const
-          srk
-          (fun s ->
-             try Symbol.Map.find s vt_map
-             with Not_found -> mk_const srk s)
-          (if dnf then (mk_and srk implicant) else phi)
-      in
-      disjuncts := disjunct::(!disjuncts);
-      Smt.Solver.add solver [mk_not srk disjunct];
-      loop ()
+               let term_val =
+                 let term_qq = evaluate_linterm (Interpretation.real interp) vt.term in
+                 match QQ.to_zz term_qq with
+                 | None -> assert false
+                 | Some zz -> zz
+               in
+               let remainder =
+                 Mpzf.fdiv_r term_val vt.divisor
+               in
+               let numerator =
+                 V.add_term (QQ.of_zz (ZZ.negate remainder)) const_dim vt.term
+               in
+               let replacement =
+                 V.scalar_mul (QQ.inverse (QQ.of_zz vt.divisor)) numerator
+                 |> V.add_term (QQ.of_zz vt.offset) const_dim
+                 |> of_linterm srk
+               in
+               let subst' =
+                 substitute_const srk
+                   (fun p -> if p = s then replacement else mk_const srk p)
+               in
+               let divides = mk_divides srk vt.divisor numerator in
+               let implicant =
+                 BatList.filter (not % is_true) (divides::(List.map subst' implicant))
+               in
+               (seq_subst s (term_of_virtual_term srk vt) subst,
+                implicant)
+             else if typ_symbol srk s = `TyReal then
+               let implicant_s =
+                 List.filter (fun atom -> Symbol.Set.mem s (symbols atom)) implicant
+               in
+               let t = Linear.of_linterm srk (select_real_term srk interp s implicant_s) in
+               let subst' =
+                 substitute_const srk
+                   (fun p -> if p = s then t else mk_const srk p)
+               in
+               let implicant =
+                 BatList.filter (not % is_true) (List.map subst' implicant)
+               in
+               (seq_subst s t subst,
+                implicant)
+             else assert false)
+           project
+           (subst, implicant)
+         |> fst
+       in
+       let disjunct =
+         substitute_map
+           srk
+           subst
+           (if dnf then (mk_and srk (div_constraints@implicant))
+            else (mk_and srk (phi::div_constraints)))
+         |> SrkSimplify.simplify_terms srk
+       in
+       disjuncts := disjunct::(!disjuncts);
+       Smt.Solver.add solver [mk_not srk disjunct];
+       loop ()
     | `Unsat -> mk_or srk (!disjuncts)
     | `Unknown -> raise Unknown
   in
@@ -1833,7 +2000,8 @@ let easy_sat srk phi =
     | `TyInt -> Skeleton.MInt (select_int_term srk model x phi)
     | `TyReal -> Skeleton.MReal (select_real_term srk model x phi)
     | `TyBool -> Skeleton.MBool (Interpretation.bool model x)
-    | `TyFun (_, _) -> assert false
+    | `TyFun (_, _) 
+    | `TyArr -> assert false
   in
   match CSS.initialize_pair select_term srk qf_pre phi with
   | `Unsat -> `Unsat
@@ -1975,16 +2143,16 @@ let check_strategy srk qf_pre phi strategy =
    over-approximate quantifier elimination. *)
 type 'a cover_virtual_term =
   | CMinusInfinity
-  | CPlusEpsilon of 'a term
-  | CTerm of 'a term
+  | CPlusEpsilon of 'a arith_term
+  | CTerm of 'a arith_term
   | CUnknown
 
 let pp_cover_virtual_term srk formatter =
   function
   | CMinusInfinity -> Format.pp_print_string formatter "-oo"
   | CPlusEpsilon t ->
-    Format.fprintf formatter "%a + epsilon" (Term.pp srk) t
-  | CTerm t -> Term.pp srk formatter t
+    Format.fprintf formatter "%a + epsilon" (ArithTerm.pp srk) t
+  | CTerm t -> ArithTerm.pp srk formatter t
   | CUnknown -> Format.pp_print_string formatter "??"
 
 let cover_virtual_term srk interp x atoms =
@@ -2000,8 +2168,9 @@ let cover_virtual_term srk interp x atoms =
   let get_equal_term atom =
     match Interpretation.destruct_atom srk atom with
     | `Literal (_, _) -> None
-    | `Comparison (`Lt, _, _) -> None
-    | `Comparison (_, s, t) ->
+    | `ArrEq _ -> None
+    | `ArithComparison (`Lt, _, _) -> None
+    | `ArithComparison (_, s, t) ->
       let sval = Interpretation.evaluate_term interp s in
       let tval = Interpretation.evaluate_term interp t in
       if QQ.equal sval tval then
@@ -2021,7 +2190,8 @@ let cover_virtual_term srk interp x atoms =
   let get_vt atom =
     match Interpretation.destruct_atom srk atom with
     | `Literal (_, _) -> None
-    | `Comparison (_, s, t) ->
+    | `ArrEq _ -> None
+    | `ArithComparison (_, s, t) ->
       match SrkSimplify.isolate_linear srk x (mk_sub srk s t) with
       | None -> raise Nonlinear
       | Some (a, b) when QQ.lt a QQ.zero ->
@@ -2042,7 +2212,7 @@ let cover_virtual_term srk interp x atoms =
 let cover_virtual_substitution srk x virtual_term phi =
   let zero = mk_real srk QQ.zero in
   let replace_atom op s t =
-    assert (Term.equal zero (mk_real srk QQ.zero));
+    assert (ArithTerm.equal zero (mk_real srk QQ.zero));
     match op, SrkSimplify.isolate_linear srk x (mk_sub srk s t), virtual_term with
     | (_, None, _) -> mk_true srk
     | (`Leq, Some (a, _), _) when QQ.equal a QQ.zero ->
@@ -2073,7 +2243,7 @@ let cover_virtual_substitution srk x virtual_term phi =
   | CUnknown ->
     let drop expr =
       match destruct srk expr with
-      | `Atom (_, _, _) ->
+      | `Atom _ ->
         if Symbol.Set.mem x (symbols expr) then
           (mk_true srk :> ('a, typ_fo) expr)
         else
@@ -2082,7 +2252,7 @@ let cover_virtual_substitution srk x virtual_term phi =
     in
     rewrite srk ~up:drop phi
   | _ ->
-    map_atoms srk replace_atom phi
+    map_arith_atoms srk replace_atom phi
 
 let mbp_cover ?(dnf=true) srk exists phi =
   let phi = eliminate_ite srk phi in
@@ -2143,3 +2313,90 @@ let local_project_cube srk exists model cube =
       |> List.filter (not % is_true))
     project
     cube
+
+let miniscope srk phi : 'a formula =
+  let flip qtyp =
+    match qtyp with
+    | `Exists -> `Forall
+    | `Forall -> `Exists
+  in
+  let pass_thru qtyp expr_typ =
+    match qtyp, expr_typ with
+    | `Exists, `Exists -> `Pass
+    | `Exists, `Forall -> `Blocking
+    | `Forall, `Forall -> `Pass
+    | `Forall, `Exists -> `Blocking
+    | `Forall, `And -> `Pass
+    | `Exists, `And -> `Blocking
+    | `Exists, `Or -> `Pass
+    | `Forall, `Or -> `Blocking
+  in
+  let mk_quant qtyp name typ phi =
+    match qtyp with
+    | `Exists -> mk_exists srk ~name typ phi
+    | `Forall -> mk_forall srk ~name typ phi
+  in
+  let mk_junct jtyp juncts =
+    match jtyp with
+    | `Or -> mk_or srk juncts
+    | `And -> mk_and srk juncts
+  in
+  (* This is the logic for pushing the quantifier qnt into formula node.*)
+  let rec pushdown qtyp name typ phi =
+    let dec_fv_by_1 phi = 
+      substitute
+        srk
+        (fun (ind, typ) -> mk_var srk (ind - 1) typ)
+        phi
+    in
+    let reorder_first_2_qnts phi =
+      substitute
+        srk
+        (fun (ind, typ) ->
+           if ind = 0 then mk_var srk 1 typ
+           else if ind = 1 then mk_var srk 0 typ
+           else mk_var srk ind typ)
+        phi
+    in
+    let handle_juncts jtyp juncts =
+      let l1, l2 = 
+        List.partition (fun conj ->
+            BatHashtbl.mem (free_vars conj) 0)
+          juncts
+      in
+      let l2' = List.map dec_fv_by_1 l2 in
+      let c = 
+        if pass_thru qtyp jtyp = `Pass || List.length l1 <= 1 then (
+          mk_junct jtyp (List.map (pushdown qtyp name typ) l1))
+        else (mk_quant qtyp name typ (mk_junct jtyp l1))
+      in
+      mk_junct jtyp (c :: l2')
+    in
+    if not (BatHashtbl.mem (free_vars phi) 0)
+    then dec_fv_by_1 phi
+    else (
+      match Formula.destruct srk phi with
+      | `Tru -> assert false
+      | `Fls -> assert false
+      (* TODO: distribute over ITE, or elim ITE. *)
+      | `Atom _  | `Proposition _ | `Ite _ -> mk_quant qtyp name typ phi
+      | `Not phi -> mk_not srk (pushdown (flip qtyp) name typ phi)
+      | `And juncts -> handle_juncts `And juncts
+      | `Or juncts -> handle_juncts `Or juncts
+      | `Quantify((q, n, t, p)) ->
+        if pass_thru qtyp q = `Blocking then
+          mk_quant qtyp name typ phi
+        else (
+          mk_quant 
+            q
+            n
+            t
+            (pushdown qtyp name typ (reorder_first_2_qnts p))))
+  in
+  let alg = function
+   | `Quantify (qtyp, name, typ, phi) ->
+      pushdown qtyp name typ phi
+   | open_phi -> Formula.construct srk open_phi
+  in
+  let phi = (Formula.eval srk alg phi) in
+  phi

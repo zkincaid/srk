@@ -3,11 +3,12 @@ open BatPervasives
 
 include Log.Make(struct let name = "srk.simplify" end)
 
+module Term = ArithTerm
 module RationalTerm = struct
   type 'a rt_context =
     { srk : 'a context;
-      int_of : 'a term -> int;
-      of_int : int -> 'a term }
+      int_of : 'a arith_term -> int;
+      of_int : int -> 'a arith_term }
 
   module QQXs = Polynomial.QQXs
   module Monomial = Polynomial.Monomial
@@ -49,7 +50,7 @@ module RationalTerm = struct
     let table = Expr.HT.create 991 in
     let enum = DynArray.create () in
     let of_int = DynArray.get enum in
-    let int_of term =
+    let int_of (term : 'a arith_term) =
       if Expr.HT.mem table term then
         Expr.HT.find table term
       else
@@ -62,7 +63,7 @@ module RationalTerm = struct
 
   let rec of_term ctx =
     let srk = ctx.srk in
-    let rat_term (term : 'a term) : 'a t =
+    let rat_term (term : 'a arith_term) : 'a t =
       { num = QQXs.of_dim (ctx.int_of term);
         den = Monomial.one }
     in
@@ -80,9 +81,10 @@ module RationalTerm = struct
         rat_term (mk_mod srk (term_of ctx x) (term_of ctx y))
       | `Ite (cond, bthen, belse) ->
         rat_term (mk_ite srk cond (term_of ctx bthen) (term_of ctx belse))
-      | `Var (v, typ) -> rat_term (mk_var srk v (typ :> typ_fo))
+      | `Var (v, _) -> rat_term (mk_var srk v `TyInt)
+      | `Select (a, i) -> rat_term (mk_select srk a (term_of ctx i))
     in
-    Term.eval srk alg
+    ArithTerm.eval srk alg
     
   and term_of ctx p =
     let srk = ctx.srk in
@@ -111,11 +113,11 @@ let simplify_term srk term =
   in
   RationalTerm.term_of ctx result
 
-let simplify_terms_rewriter srk =
+let simplify_terms_rewriter srk : 'a Syntax.rewriter =
   let ctx = RationalTerm.mk_context srk in
   fun expr ->
     match destruct srk expr with
-    | `Atom (op, s, t) ->
+    | `Atom (`Arith (op, s, t)) ->
       let open RationalTerm in
       let rf = (* s - t, as a rational function *)
         let rf =
@@ -360,3 +362,236 @@ let simplify_dda srk phi =
       simplified
   in
   simplify_dda_impl phi
+
+(* Given a term of the form floor(x/d) with d a positive int, retrieve the pair (x,d) *)
+let destruct_idiv srk t =
+  match Term.destruct srk t with
+  | `Unop (`Floor, t) -> begin match Term.destruct srk t with
+      | `Binop (`Div, num, den) -> begin match Term.destruct srk den with
+          | `Real den -> begin match QQ.to_int den with
+              | Some den when den > 0 -> Some (num, den)
+              | _ -> None
+            end
+          | _ -> None
+        end
+      | _ -> None
+    end
+  | _ -> None
+
+let idiv_to_ite ?(max=max_int) srk expr =
+  match Expr.refine srk expr with
+  | `ArithTerm t -> begin match destruct_idiv srk t with
+      | Some (num, den) when den < max ->
+        let den_term = mk_real srk (QQ.of_int den) in
+        let num_over_den =
+          mk_mul srk [mk_real srk (QQ.of_frac 1 den); num]
+        in
+        let offset =
+          BatEnum.fold (fun else_ r ->
+              let remainder_is_r =
+                mk_eq srk
+                  (mk_mod srk (mk_sub srk num (mk_real srk (QQ.of_int r))) den_term)
+                  (mk_real srk QQ.zero)
+              in
+              mk_ite srk
+                remainder_is_r
+                (mk_real srk (QQ.of_frac (-r) den))
+                else_)
+            (mk_real srk QQ.zero)
+            (1 -- (den-1))
+        in
+        (mk_add srk [num_over_den; offset] :> ('a,typ_fo) expr)
+     | _ -> expr
+     end
+  | _ -> expr
+
+let eliminate_idiv ?(max=max_int) srk formula =
+  formula 
+  |> rewrite srk ~up:(idiv_to_ite ~max srk)
+  |> eliminate_ite srk
+
+let purify_floor srk expr = 
+  let table = Expr.HT.create 991 in
+  let rewriter expr =
+    match destruct srk expr with
+    | `Quantify (_, _, _, _) -> invalid_arg "purify_floor: free variable" 
+    | `Unop (`Floor, t) ->
+       if (expr_typ srk t) = `TyInt then 
+        (t :> ('a, typ_fo) expr)
+       else
+         let sym =
+           try
+             Expr.HT.find table t
+           with Not_found ->
+             let sym = mk_symbol srk ~name:"floor" `TyInt in
+             Expr.HT.add table t sym;
+             sym
+         in
+         mk_const srk sym
+    | _ -> expr
+  in
+  let expr' = rewrite srk ~up:rewriter expr in
+  let map =
+    BatEnum.fold
+      (fun map (term, sym) -> Symbol.Map.add sym term map)
+      Symbol.Map.empty
+      (Expr.HT.enum table)
+  in
+  (expr', map)
+
+let eliminate_floor srk formula =
+  let formula = eliminate_idiv ~max:10 srk formula in
+  let (formula, map) = purify_floor srk formula in
+  let one = mk_int srk 1 in
+  (* For each term s = floor(t), we have t-1 < s <= t *)
+  let floor_constraints =
+    Symbol.Map.fold (fun sym term constraints ->
+        let s = mk_const srk sym in
+        (mk_leq srk s term)::(mk_lt srk (mk_sub srk term one) s)::constraints)
+      map
+      []
+  in
+  mk_and srk (formula::floor_constraints)
+
+let simplify_integer_atom srk op s t =
+  let zero = mk_real srk QQ.zero in
+  let destruct_int term =
+    match Term.destruct srk term with
+    | `Real q ->
+      begin match QQ.to_zz q with
+        | Some z -> z
+        | None -> invalid_arg "simplify_atom: non-integral value"
+      end
+    | _ -> invalid_arg "simplify_atom: non-constant"
+  in
+  let (s, op) =
+    let s =
+      if Term.equal t zero then s
+      else mk_sub srk s t
+    in
+    match op with
+    | `Lt when (expr_typ srk s = `TyInt) ->
+      (simplify_term srk (mk_add srk [s; mk_real srk QQ.one]), `Leq)
+    | _ -> (simplify_term srk s, op)
+  in
+  (* Scale a linterm with rational coefficients so that all coefficients are
+      integral *)
+  let zz_linterm term =
+    let qq_linterm = Linear.linterm_of srk term in
+    let multiplier = 
+      BatEnum.fold (fun multiplier (qq, _) ->
+          ZZ.lcm (QQ.denominator qq) multiplier)
+        ZZ.one
+        (Linear.QQVector.enum qq_linterm)
+    in
+    (multiplier, Linear.QQVector.scalar_mul (QQ.of_zz multiplier) qq_linterm)
+  in
+  match op with
+  | `Eq | `Leq ->
+    begin match Term.destruct srk s with
+    | `Binop (`Mod, dividend, modulus) ->
+      (* Divisibility constraint *)
+      let modulus = destruct_int modulus in
+      let (multiplier, lt) = zz_linterm dividend in
+      `Divides (ZZ.mul multiplier modulus, lt)
+    | `Unop (`Neg, s') ->
+      begin match Term.destruct srk s' with
+        | `Binop (`Mod, dividend, modulus) ->
+          if op = `Leq then
+            (* trivial *)
+            `CompareZero (`Leq, Linear.QQVector.zero)
+          else
+            (* Divisibility constraint *)
+            let modulus = destruct_int modulus in
+            let (multiplier, lt) = zz_linterm dividend in
+            `Divides (ZZ.mul multiplier modulus, lt)
+        | _ -> `CompareZero (op, snd (zz_linterm s))
+      end
+    | `Add [x; y] ->
+      begin match Term.destruct srk x, Term.destruct srk y with
+        | `Real k, `Binop (`Mod, dividend, modulus)
+        | `Binop (`Mod, dividend, modulus), `Real k when QQ.lt k QQ.zero && op = `Eq ->
+          let (multiplier, lt) = zz_linterm dividend in
+          let modulus = destruct_int modulus in
+          if ZZ.equal multiplier ZZ.one && QQ.lt k (QQ.of_zz modulus) then
+            let lt = Linear.QQVector.add_term k Linear.const_dim lt in
+            `Divides (modulus, lt)
+          else
+            `CompareZero (op, snd (zz_linterm s))
+        | `Binop (`Mod, dividend, modulus), `Real k when QQ.equal QQ.one k && op = `Leq ->
+          let (multiplier, lt) = zz_linterm dividend in
+          let modulus = destruct_int modulus in
+          if ZZ.equal multiplier ZZ.one then
+            `NotDivides (modulus, lt)
+          else
+            `CompareZero (op, snd (zz_linterm s))
+        | `Real k, `Unop (`Neg, z) | `Unop (`Neg, z), `Real k
+              when QQ.equal k QQ.one && op = `Leq ->
+          begin match Term.destruct srk z with
+            | `Binop (`Mod, dividend, modulus) ->
+                (* 1 <= dividend % modulus *)
+              let modulus = destruct_int modulus in
+              let (multiplier, lt) = zz_linterm dividend in
+              `NotDivides (ZZ.mul multiplier modulus, lt)
+            | _ -> `CompareZero (op, snd (zz_linterm s))
+          end
+        | _, _ -> `CompareZero (op, snd (zz_linterm s))
+      end
+    | _ -> `CompareZero (op, snd (zz_linterm s))
+    end
+  | `Lt ->
+    begin match Term.destruct srk s with
+      | `Binop (`Mod, dividend, modulus) ->
+        (* Indivisibility constraint: dividend % modulus < 0. *)
+        let modulus = destruct_int modulus in
+        let (multiplier, lt) = zz_linterm dividend in
+        `NotDivides (ZZ.mul multiplier modulus, lt)
+
+      | `Unop (`Neg, s') ->
+        begin match Term.destruct srk s' with
+          | `Binop (`Mod, dividend, modulus) ->
+            (* Indivisibility constraint: dividend % modulus > 0 *)
+            let modulus = destruct_int modulus in
+            let (multiplier, lt) = zz_linterm dividend in
+            `NotDivides (ZZ.mul multiplier modulus, lt)
+          | _ -> `CompareZero (`Lt, snd (zz_linterm s))
+        end
+
+      | _ -> `CompareZero (`Lt, snd (zz_linterm s))
+    end
+
+
+type 'a flatten_typ = Phi of 'a formula | Disj of 'a formula list | Conj of 'a formula list
+let flatten srk phi =
+  let phiize flatten_typ =
+    match flatten_typ with
+    | Phi phi -> phi
+    | Disj phis -> mk_or srk phis
+    | Conj phis -> mk_and srk phis
+  in
+  let alg = function
+    | `And conjs ->
+      let nested_conjs, others = 
+        BatList.partition_map (fun conj ->
+            match conj with
+            | Conj phis -> Left phis
+            | Phi phi -> Right phi
+            | Disj phis -> Right (mk_or srk phis))
+          conjs 
+      in
+      let nested_conjs = List.flatten nested_conjs in
+      Conj (nested_conjs @ others)
+    | `Or disjs ->
+      let nested_disjs, others = 
+        BatList.partition_map (fun disj ->
+            match disj with
+            | Conj phis -> Right (mk_and srk phis)
+            | Phi phi -> Right phi
+            | Disj phis -> Left phis)
+          disjs
+      in
+      let nested_disjs = List.flatten nested_disjs in
+      Disj (nested_disjs @ others)
+    | phi -> Phi (Formula.map_construct srk phiize phi)
+  in
+  phiize (Formula.eval srk alg phi)
