@@ -509,6 +509,40 @@ module Solver = struct
   let get_reason_unknown solver = Z3.Solver.get_reason_unknown solver.s
 end
 
+module UnsatCoreSolver = struct
+  type 'a t = 'a solver
+
+  let add_l solver assertions =
+    let (assertions, (cores, core_assertions)) =
+      List.fold_left (fun (assertions, (cores, core_assertions)) (ass, b) ->
+        if b then
+          assertions, ((mk_const solver.srk (mk_symbol solver.srk `TyBool)) :: cores, ass :: core_assertions)
+        else
+          ass :: assertions, (cores, core_assertions)
+      ) ([], ([], [])) assertions
+    in
+    Z3.Solver.add solver.s (List.map solver.of_formula assertions);
+    Z3.Solver.assert_and_track_l solver.s (List.map solver.of_formula cores) (List.map solver.of_formula core_assertions)
+
+  let add solver ?(core = false) assertions =
+    add_l solver (List.map (fun ass -> (ass, core)) assertions)
+
+  let push = Solver.push
+  let pop = Solver.pop
+  let reset = Solver.reset
+
+  let check = Solver.check
+
+  let to_string = Solver.to_string
+
+  let get_model = Solver.get_model
+  let get_concrete_model = Solver.get_concrete_model
+
+  let get_unsat_core = Solver.get_unsat_core
+
+  let get_reason_unknown = Solver.get_reason_unknown
+end
+
 let optimize_box ?(context=Z3.mk_context []) srk phi objectives =
   let open Z3.Optimize in
   let z3 = context in

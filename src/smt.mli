@@ -2,6 +2,9 @@
 open Syntax
 open Interpretation
 
+type 'a solver
+val mk_solver : ?theory:string -> 'a context -> 'a solver
+
 module Solver : sig
   type 'a t
   val add : 'a t -> ('a formula) list -> unit
@@ -23,9 +26,43 @@ module Solver : sig
   val get_unsat_core : 'a t ->
     ('a formula) list ->
     [ `Sat | `Unsat of ('a formula) list | `Unknown ]
-end
+end with type 'a t = 'a solver
 
-val mk_solver : ?theory:string -> 'a context -> 'a Solver.t
+module UnsatCoreSolver : sig
+  type 'a t
+  val add : 'a t -> ?core:bool -> ('a formula) list -> unit
+  val add_l : 'a t -> ('a formula * bool) list -> unit
+  val push : 'a t -> unit
+  val pop : 'a t -> int -> unit
+  val reset : 'a t -> unit
+  val check : 'a t -> ('a formula) list -> [ `Sat | `Unsat | `Unknown ]
+  val to_string : 'a t -> string
+
+  (** Compute a model of a solver's context.  The model is abstract -- it can
+      be used to evaluate terms, but its bindings may not be enumerated (see
+      [Interpretation] for more detail). *)
+  val get_model : ?symbols:(symbol list) ->
+    'a t ->
+    [ `Sat of 'a interpretation
+    | `Unsat
+    | `Unknown ]
+
+  (** Compute a model of the a solver's context, and return an intepretation
+      that binds the specified subset of symbols.  If the symbol list contains
+      all symbols of the formula, then the interpretation is a model of the
+      solver's context. *)
+  val get_concrete_model : 'a t ->
+    symbol list ->
+    [ `Sat of 'a interpretation
+    | `Unsat
+    | `Unknown ]
+
+  val get_unsat_core : 'a t ->
+    ('a formula) list ->
+    [ `Sat | `Unsat of ('a formula) list | `Unknown ]
+
+  val get_reason_unknown : 'a t -> string
+end with type 'a t = 'a solver
 
 (** Compute a model of a formula.  The model is abstract -- it can be used to
     evaluate terms, but its bindings may not be enumerated (see

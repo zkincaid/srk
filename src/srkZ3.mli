@@ -43,6 +43,8 @@ val formula_of_z3 : 'a context -> z3_expr -> 'a formula
     failure. *)
 val expr_of_z3 : 'a context -> z3_expr -> ('a,typ_fo) expr
 
+type 'a solver
+
 module Solver : sig
   type 'a t
   val add : 'a t -> ('a formula) list -> unit
@@ -76,9 +78,50 @@ module Solver : sig
     [ `Sat | `Unsat of ('a formula) list | `Unknown ]
 
   val get_reason_unknown : 'a t -> string
-end
+end with type 'a t = 'a solver
 
-val mk_solver : ?context:z3_context -> ?theory:string -> 'a context -> 'a Solver.t
+(* This module is the same as Solver, except it allows easily specifying which assertions
+   should be considered in the Unsat Core computed by Z3. By default the optional core
+   parameter is false, and this module will behave the same as Solver.
+
+   Note: all boolean variables/symbols will be considered in the unsat core. *)
+module UnsatCoreSolver : sig
+  type 'a t
+  val add : 'a t -> ?core:bool -> ('a formula) list -> unit
+  val add_l : 'a t -> ('a formula * bool) list -> unit
+  val push : 'a t -> unit
+  val pop : 'a t -> int -> unit
+  val reset : 'a t -> unit
+  val check : 'a t -> ('a formula) list -> [ `Sat | `Unsat | `Unknown ]
+  val to_string : 'a t -> string
+
+  (** Compute a model of a solver's context.  The model is abstract -- it can
+      be used to evaluate terms, but its bindings may not be enumerated (see
+      [Interpretation] for more detail). *)
+  val get_model : ?symbols:(symbol list) ->
+    'a t ->
+    [ `Sat of 'a interpretation
+    | `Unsat
+    | `Unknown ]
+
+  (** Compute a model of the a solver's context, and return an intepretation
+      that binds the specified subset of symbols.  If the symbol list contains
+      all symbols of the formula, then the interpretation is a model of the
+      solver's context. *)
+  val get_concrete_model : 'a t ->
+    symbol list ->
+    [ `Sat of 'a interpretation
+    | `Unsat
+    | `Unknown ]
+
+  val get_unsat_core : 'a t ->
+    ('a formula) list ->
+    [ `Sat | `Unsat of ('a formula) list | `Unknown ]
+
+  val get_reason_unknown : 'a t -> string
+end with type 'a t = 'a solver
+
+val mk_solver : ?context:z3_context -> ?theory:string -> 'a context -> 'a solver
 
 (** Given a formula phi and a list of objectives [o1,...,on], find the least
     bounding interval for each objective within the feasible region defined by

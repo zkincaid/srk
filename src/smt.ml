@@ -3,9 +3,11 @@ open BatPervasives
 
 include Log.Make(struct let name = "srk.smt" end)
 
-module Solver = SrkZ3.Solver
-
+type 'a solver = 'a SrkZ3.solver
 let mk_solver ?(theory="") srk = SrkZ3.mk_solver ~theory srk
+
+module Solver = SrkZ3.Solver
+module UnsatCoreSolver = SrkZ3.UnsatCoreSolver
 
 let get_model ?(symbols=[]) srk phi =
   let solver = mk_solver srk in
