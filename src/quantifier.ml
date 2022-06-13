@@ -421,6 +421,93 @@ let term_of_virtual_term srk vt =
   in
   mk_add srk [term_over_div; offset]
 
+let miniscope srk phi : 'a formula =
+  let flip qtyp =
+    match qtyp with
+    | `Exists -> `Forall
+    | `Forall -> `Exists
+  in
+  let pass_thru qtyp expr_typ =
+    match qtyp, expr_typ with
+    | `Exists, `Exists -> `Pass
+    | `Exists, `Forall -> `Blocking
+    | `Forall, `Forall -> `Pass
+    | `Forall, `Exists -> `Blocking
+    | `Forall, `And -> `Pass
+    | `Exists, `And -> `Blocking
+    | `Exists, `Or -> `Pass
+    | `Forall, `Or -> `Blocking
+  in
+  let mk_quant qtyp name typ phi =
+    match qtyp with
+    | `Exists -> mk_exists srk ~name typ phi
+    | `Forall -> mk_forall srk ~name typ phi
+  in
+  let mk_junct jtyp juncts =
+    match jtyp with
+    | `Or -> mk_or srk juncts
+    | `And -> mk_and srk juncts
+  in
+  (* This is the logic for pushing the quantifier qnt into formula node.*)
+  let rec pushdown qtyp name typ phi =
+    let dec_fv_by_1 phi =
+      substitute
+        srk
+        (fun (ind, typ) -> mk_var srk (ind - 1) typ)
+        phi
+    in
+    let reorder_first_2_qnts phi =
+      substitute
+        srk
+        (fun (ind, typ) ->
+           if ind = 0 then mk_var srk 1 typ
+           else if ind = 1 then mk_var srk 0 typ
+           else mk_var srk ind typ)
+        phi
+    in
+    let handle_juncts jtyp juncts =
+      let l1, l2 =
+        List.partition (fun conj ->
+            BatHashtbl.mem (free_vars conj) 0)
+          juncts
+      in
+      let l2' = List.map dec_fv_by_1 l2 in
+      let c =
+        if pass_thru qtyp jtyp = `Pass || List.length l1 <= 1 then (
+          mk_junct jtyp (List.map (pushdown qtyp name typ) l1))
+        else (mk_quant qtyp name typ (mk_junct jtyp l1))
+      in
+      mk_junct jtyp (c :: l2')
+    in
+    if not (BatHashtbl.mem (free_vars phi) 0)
+    then dec_fv_by_1 phi
+    else (
+      match Formula.destruct srk phi with
+      | `Tru -> assert false
+      | `Fls -> assert false
+      (* TODO: distribute over ITE, or elim ITE. *)
+      | `Atom _  | `Proposition _ | `Ite _ -> mk_quant qtyp name typ phi
+      | `Not phi -> mk_not srk (pushdown (flip qtyp) name typ phi)
+      | `And juncts -> handle_juncts `And juncts
+      | `Or juncts -> handle_juncts `Or juncts
+      | `Quantify((q, n, t, p)) ->
+        if pass_thru qtyp q = `Blocking then
+          mk_quant qtyp name typ phi
+        else (
+          mk_quant
+            q
+            n
+            t
+            (pushdown qtyp name typ (reorder_first_2_qnts p))))
+  in
+  let alg = function
+   | `Quantify (qtyp, name, typ, phi) ->
+      pushdown qtyp name typ phi
+   | open_phi -> Formula.construct srk open_phi
+  in
+  let phi = (Formula.eval srk alg phi) in
+  phi
+
 exception Redundant_path
 module Skeleton = struct
   type exists_move =
@@ -2243,22 +2330,44 @@ module FineGrainStrategyImprovement = struct
         in
         rewrite srk ~up:rewriter t
       in
+      let flatten_go comb comb_qff phis =
+        let qff, phis =
+          List.fold_left (fun (qff, phis) (qff', phi) ->
+            (qff && qff', phi :: phis)
+          ) (true, []) (List.rev_map (go env) phis)
+        in
+        if qff then
+          let phis =
+            List.map (fun phi ->
+              match phi with
+              | `Atom phi -> phi
+              | _ -> assert false
+            ) phis
+          in
+          (true, `Atom (comb_qff phis))
+        else
+          (false, comb phis)
+      in
       match Formula.destruct srk phi with
-      | `And phis -> `And (List.map (go env) phis)
-      | `Or phis -> `Or (List.map (go env) phis)
-      | `Not phi -> negate srk (go env phi)
+      | `And phis -> flatten_go (fun phis -> `And phis) (mk_and srk) phis
+      | `Or phis -> flatten_go (fun phis -> `Or phis) (mk_or srk) phis
+      | `Not phi -> let qff, phi = go env phi in (qff, negate srk phi)
       | `Quantify (`Exists, name, typ, phi) ->
         let k = mk_symbol srk ~name (typ :> Syntax.typ) in
-        `Exists (k, go (Env.push k env) phi)
+        let _, phi = go (Env.push k env) phi in
+        (false, `Exists (k, phi))
       | `Quantify (`Forall, name, typ, phi) ->
         let k = mk_symbol srk ~name (typ :> Syntax.typ) in
-        `Forall (k, go (Env.push k env) phi)
-      | `Proposition (`Var i) -> `Atom (mk_const srk (Env.find env i))
-      | `Atom (`Arith (`Eq, s, t)) -> `Atom (mk_eq srk (mk_sub srk (go_term s) (go_term t)) zero)
-      | `Atom (`Arith (`Leq, s, t)) -> `Atom (mk_leq srk (mk_sub srk (go_term s) (go_term t)) zero)
-      | `Atom (`Arith (`Lt, s, t)) -> `Atom (mk_lt srk (mk_sub srk (go_term s) (go_term t)) zero)
-      | _ -> `Atom phi
-    in go Env.empty (eliminate_ite srk phi)
+        let _, phi = go (Env.push k env) phi in
+        (false, `Forall (k, phi))
+      | `Proposition (`Var i) -> (true, `Atom (mk_const srk (Env.find env i)))
+      | `Atom (`Arith (`Eq, s, t)) -> (true, `Atom (mk_eq srk (mk_sub srk (go_term s) (go_term t)) zero))
+      | `Atom (`Arith (`Leq, s, t)) -> (true, `Atom (mk_leq srk (mk_sub srk (go_term s) (go_term t)) zero))
+      | `Atom (`Arith (`Lt, s, t)) -> (true, `Atom (mk_lt srk (mk_sub srk (go_term s) (go_term t)) zero))
+      | _ -> (true, `Atom phi)
+    in
+    let (_, phi) = go Env.empty (eliminate_ite srk phi) in
+    phi
 
   let pp_normal srk formatter phi =
     let rec go formatter phi =
@@ -2722,10 +2831,199 @@ module FineGrainStrategyImprovement = struct
       CSS.reset unsat_ctx;
       CSS.is_sat select_term sat_ctx unsat_ctx
 
+  let simsat_forward_core srk phi =
+    let select_term model x atoms =
+      match typ_symbol srk x with
+      | `TyInt -> Skeleton.MInt (select_int_term srk model x atoms)
+      | `TyReal -> Skeleton.MReal (select_real_term srk model x atoms)
+      | `TyBool -> Skeleton.MBool (Interpretation.bool model x)
+      | `TyFun (_, _) -> assert false
+      | `TyArr -> assert false
+    in
+
+    (* If SAT plays first, check satisfiability of the negated sentence instead,
+       then negate the result. We may now assume that UNSAT always plays first. *)
+    let (phi, negate) =
+      match phi with
+      | `Exists _ | `Or _ -> (negate srk phi, true)
+      | _ -> (phi, false)
+    in
+    match CSS.initialize_pair select_term srk phi with
+    | `Unsat ->
+      (* Matrix is unsat -> any unsat strategy is winning *)
+      let open Skeleton.FineGrain in
+      let rec go = function
+        | `Forall (k, psi) ->
+          let sk = mk_symbol srk ~name:(show_symbol srk k) (typ_symbol srk k) in
+          SForall (k, sk, go psi)
+        | `Exists (k, psi) ->
+          let move =
+            match typ_symbol srk k with
+            | `TyReal -> Skeleton.MReal (Linear.const_linterm QQ.zero)
+            | `TyInt -> Skeleton.MInt { term = Linear.const_linterm QQ.zero;
+                                        divisor = ZZ.one;
+                                        offset = ZZ.zero }
+            | `TyBool -> Skeleton.MBool true
+            | _ -> assert false
+          in
+          SExists (k, Skeleton.MM.singleton move (go psi))
+        | `And phis -> SAnd (List.map (fun phi -> (mk_symbol srk ~name:"B" `TyBool, go phi)) phis)
+        | `Or phis -> SOr (IM.singleton 0 (go (List.hd phis)))
+        | `Atom _ -> SEmpty
+      in
+      if negate then `Sat (go phi)
+      else `Unsat (go phi)
+
+    | `Unknown -> `Unknown
+    | `Sat (sat_ctx, _) ->
+      let assert_param_constraints ctx parameter_interp =
+        let open CSS in
+        BatEnum.iter (function
+            | (k, `Real qv) ->
+              Smt.Solver.add ctx.solver [mk_eq srk (mk_const srk k) (mk_real srk qv)]
+            | (k, `Bool false) ->
+              Smt.Solver.add ctx.solver [mk_not srk (mk_const srk k)]
+            | (k, `Bool true) ->
+              Smt.Solver.add ctx.solver  [mk_const srk k]
+            | (_, `Fun _) -> ())
+          (Interpretation.enum parameter_interp)
+      in
+      let mk_unsat_ctx skeleton parameter_interp phi not_phi =
+        let open CSS in
+        let lose =
+          Skeleton.FineGrain.losing_formula srk skeleton not_phi
+        in
+        let ctx =
+          { formula = not_phi;
+            not_formula = phi;
+            skeleton = skeleton;
+            solver = Smt.mk_solver srk;
+            srk = srk }
+        in
+        Smt.Solver.add ctx.solver [lose];
+        assert_param_constraints ctx parameter_interp;
+        ctx
+      in
+
+      (* Peel leading SAT choices (existentials and disjunctions) off of a skeleton.
+         Fails if there is more than one move for a SAT choice in the prefix.
+         We also return the sub formula, and it's negation. *)
+      let rec sat_prefix skel phi not_phi =
+        match skel, phi, not_phi with
+        | Skeleton.FineGrain.SExists (k, mm), `Forall (_, phi), `Exists (_, not_phi) ->
+          begin match BatList.of_enum (Skeleton.MM.enum mm) with
+          | [(move, skeleton)] ->
+            let (ex_pre, sub_skeleton, phi, not_phi) = sat_prefix skeleton phi not_phi in
+            ((k, move)::ex_pre, sub_skeleton, phi, not_phi)
+          | _ -> assert false
+          end
+        | Skeleton.FineGrain.SOr im, `And phis, `Or not_phis ->
+          begin match BatList.of_enum (Skeleton.FineGrain.IM.enum im) with
+          | [(i, skeleton)] -> sat_prefix skeleton (List.nth phis i) (List.nth not_phis i)
+          | _ -> assert false
+          end
+        | Skeleton.FineGrain.SExists _, _, _ | Skeleton.FineGrain.SOr _, _, _ ->
+          assert false
+        | _ -> ([], skel, phi, not_phi)
+      in
+
+      (* Compute a winning strategy for the remainder of the game, after the
+         prefix play determined by parameter_interp.  Skeleton is an initial
+         candidate strategy for one of the players, which begins with
+         universals. *)
+      let rec solve_game polarity param_interp ctx =
+        logf ~attributes:[`Green] "Solving game %s (%d/%d)"
+          (if polarity then "SAT" else "UNSAT")
+          (Skeleton.FineGrain.nb_paths ctx.CSS.skeleton)
+          (Skeleton.FineGrain.size ctx.CSS.skeleton);
+        logf ~level:`trace "Parameters: %a" Interpretation.pp param_interp;
+        match CSS.get_counter_strategy select_term ~parameters:(Some param_interp) ctx with
+        | `Unknown -> `Unknown
+        | `Unsat ->
+          (* No counter-strategy to the strategy of the active player => active
+             player wins *)
+          `Sat ctx.CSS.skeleton
+        | `Sat unsat_skel -> (* inactive player has a counter strategy *)
+          let (ex_pre, sub_skeleton, phi, not_phi) = sat_prefix unsat_skel ctx.CSS.formula ctx.CSS.not_formula in
+          let param_interp =
+            List.fold_left (fun interp (k, move) ->
+                match move with
+                | Skeleton.MBool bv -> Interpretation.add_bool k bv interp
+                | move ->
+                  Interpretation.add_real
+                    k
+                    (Skeleton.evaluate_move (Interpretation.real interp) move)
+                    interp
+              ) param_interp ex_pre
+          in
+          let sub_ctx = mk_unsat_ctx sub_skeleton param_interp phi not_phi in
+          match solve_game (not polarity) param_interp sub_ctx with
+          | `Unknown -> `Unknown
+          | `Sat skeleton ->
+            (* Inactive player wins *)
+            let skeleton =
+              let rec go = function
+                | Skeleton.FineGrain.SExists (k, mm) ->
+                  begin match BatList.of_enum (Skeleton.MM.enum mm) with
+                  | [(move, skel)] ->
+                    let mm = Skeleton.MM.add move (go skel) Skeleton.MM.empty in
+                    Skeleton.FineGrain.SExists (k, mm)
+                  | _ -> assert false
+                  end
+                | Skeleton.FineGrain.SOr im ->
+                  begin match BatList.of_enum (Skeleton.FineGrain.IM.enum im) with
+                  | [(i, skel)] ->
+                    let im = Skeleton.FineGrain.IM.add i (go skel) Skeleton.FineGrain.IM.empty in
+                    Skeleton.FineGrain.SOr im
+                  | _ -> assert false
+                  end
+                | _ -> skeleton
+              in go unsat_skel
+            in
+            `Unsat skeleton
+          | `Unsat skeleton' ->
+            (* There is a counter-strategy for the strategy of the inactive
+               player => augment strategy for the active player & try again *)
+            let open CSS in
+            let skeleton = (* compute union of ctx.skeleton and skeleton' that starts after unsat_skel's sat_prefix *)
+              let rec go sat_skel unsat_skel =
+                match sat_skel, unsat_skel with
+                | Skeleton.FineGrain.SForall (k, sk, sat_skel), Skeleton.FineGrain.SExists (_, mm) ->
+                  begin match BatList.of_enum (Skeleton.MM.enum mm) with
+                  | [(_, unsat_skel)] ->
+                    Skeleton.FineGrain.SForall (k, sk, go sat_skel unsat_skel)
+                  | _ -> assert false
+                  end
+                | Skeleton.FineGrain.SAnd sat_skels, Skeleton.FineGrain.SOr im ->
+                  begin match BatList.of_enum (Skeleton.FineGrain.IM.enum im) with
+                  | [(i, unsat_skel)] ->
+                    Skeleton.FineGrain.SAnd (List.mapi (fun j (b, sat_skel) ->
+                                                         if i = j then
+                                                           (b, go sat_skel unsat_skel)
+                                                         else
+                                                           (b, sat_skel)
+                                                       ) sat_skels)
+                  | _ -> assert false
+                  end
+                | Skeleton.FineGrain.SForall _, _ | Skeleton.FineGrain.SAnd _, _ -> assert false
+                | _, _ -> Skeleton.FineGrain.union srk sat_skel skeleton'
+              in go ctx.skeleton unsat_skel
+            in
+            Skeleton.FineGrain.union_losing_formula srk ctx.skeleton skeleton ctx.formula
+            |> List.map (fun phi -> Interpretation.substitute param_interp phi)
+            |> Smt.Solver.add ctx.solver;
+            ctx.skeleton <- skeleton;
+            solve_game polarity param_interp ctx
+      in
+      match solve_game true (Interpretation.empty srk) sat_ctx with
+      | `Unknown -> `Unknown
+      | `Sat skeleton -> if negate then `Unsat skeleton else `Sat skeleton
+      | `Unsat skeleton -> if negate then `Sat skeleton else `Unsat skeleton
+
   let simsat srk phi =
     let constants = fold_constants Symbol.Set.add phi Symbol.Set.empty in
     let phi =
-      normalize srk phi
+      normalize srk (miniscope srk phi)
       |> Symbol.Set.fold (fun sym phi ->
            `Exists (sym, phi)
          ) constants
@@ -2735,7 +3033,19 @@ module FineGrainStrategyImprovement = struct
     | `Unsat _ -> `Unsat
     | `Unknown -> `Unknown
 
-  let simsat_forward _ _ = failwith "Quantifier.FineGrainStrategyImprovement.simsat_forward not implemented"
+  let simsat_forward srk phi =
+    let constants = fold_constants Symbol.Set.add phi Symbol.Set.empty in
+    let phi =
+      normalize srk (miniscope srk phi)
+      |> Symbol.Set.fold (fun sym phi ->
+           `Exists (sym, phi)
+         ) constants
+    in
+    match simsat_forward_core srk phi with
+    | `Sat _ -> `Sat
+    | `Unsat _ -> `Unsat
+    | `Unknown -> `Unknown
+
   let maximize _ _ _ = failwith "Quantifier.FineGrainStrategyImprovement.maximize not implemented"
   let easy_sat _ _ = failwith "Quantifier.FineGrainStrategyImprovement.easy_sat not implemented"
 
@@ -3552,90 +3862,3 @@ let local_project_cube srk exists model cube =
       |> List.filter (not % is_true))
     project
     cube
-
-let miniscope srk phi : 'a formula =
-  let flip qtyp =
-    match qtyp with
-    | `Exists -> `Forall
-    | `Forall -> `Exists
-  in
-  let pass_thru qtyp expr_typ =
-    match qtyp, expr_typ with
-    | `Exists, `Exists -> `Pass
-    | `Exists, `Forall -> `Blocking
-    | `Forall, `Forall -> `Pass
-    | `Forall, `Exists -> `Blocking
-    | `Forall, `And -> `Pass
-    | `Exists, `And -> `Blocking
-    | `Exists, `Or -> `Pass
-    | `Forall, `Or -> `Blocking
-  in
-  let mk_quant qtyp name typ phi =
-    match qtyp with
-    | `Exists -> mk_exists srk ~name typ phi
-    | `Forall -> mk_forall srk ~name typ phi
-  in
-  let mk_junct jtyp juncts =
-    match jtyp with
-    | `Or -> mk_or srk juncts
-    | `And -> mk_and srk juncts
-  in
-  (* This is the logic for pushing the quantifier qnt into formula node.*)
-  let rec pushdown qtyp name typ phi =
-    let dec_fv_by_1 phi = 
-      substitute
-        srk
-        (fun (ind, typ) -> mk_var srk (ind - 1) typ)
-        phi
-    in
-    let reorder_first_2_qnts phi =
-      substitute
-        srk
-        (fun (ind, typ) ->
-           if ind = 0 then mk_var srk 1 typ
-           else if ind = 1 then mk_var srk 0 typ
-           else mk_var srk ind typ)
-        phi
-    in
-    let handle_juncts jtyp juncts =
-      let l1, l2 = 
-        List.partition (fun conj ->
-            BatHashtbl.mem (free_vars conj) 0)
-          juncts
-      in
-      let l2' = List.map dec_fv_by_1 l2 in
-      let c = 
-        if pass_thru qtyp jtyp = `Pass || List.length l1 <= 1 then (
-          mk_junct jtyp (List.map (pushdown qtyp name typ) l1))
-        else (mk_quant qtyp name typ (mk_junct jtyp l1))
-      in
-      mk_junct jtyp (c :: l2')
-    in
-    if not (BatHashtbl.mem (free_vars phi) 0)
-    then dec_fv_by_1 phi
-    else (
-      match Formula.destruct srk phi with
-      | `Tru -> assert false
-      | `Fls -> assert false
-      (* TODO: distribute over ITE, or elim ITE. *)
-      | `Atom _  | `Proposition _ | `Ite _ -> mk_quant qtyp name typ phi
-      | `Not phi -> mk_not srk (pushdown (flip qtyp) name typ phi)
-      | `And juncts -> handle_juncts `And juncts
-      | `Or juncts -> handle_juncts `Or juncts
-      | `Quantify((q, n, t, p)) ->
-        if pass_thru qtyp q = `Blocking then
-          mk_quant qtyp name typ phi
-        else (
-          mk_quant 
-            q
-            n
-            t
-            (pushdown qtyp name typ (reorder_first_2_qnts p))))
-  in
-  let alg = function
-   | `Quantify (qtyp, name, typ, phi) ->
-      pushdown qtyp name typ phi
-   | open_phi -> Formula.construct srk open_phi
-  in
-  let phi = (Formula.eval srk alg phi) in
-  phi

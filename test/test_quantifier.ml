@@ -267,7 +267,7 @@ let suite = "Quantifier" >::: [
 
     (* Fine Grain Simsat tests *)
     "simsat_ground_fine_grain" >:: simsat_ground fg_simsat;
-    (* "simsat_forward_ground_fine_grain" >:: simsat_ground fg_simsat_forward;    (* not implemented *) *)
+    "simsat_forward_ground_fine_grain" >:: simsat_ground fg_simsat_forward;
     "simsat1_fine_grain" >:: simsat1 fg_simsat;
     "sim1_fine_grain" >:: sim1 "sim1_fine_grain" fg_simsat;
     "sim2_fine_grain" >:: sim2 "sim2_fine_grain" fg_simsat;
