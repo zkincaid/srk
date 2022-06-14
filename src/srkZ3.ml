@@ -293,7 +293,7 @@ and z3_of_formula srk z3 =
       Z3.Expr.mk_app z3 decl (List.map (z3_of_expr srk z3) args)
     | `Ite (cond, bthen, belse) -> Z3.Boolean.mk_ite z3 cond bthen belse
   in
-  Formula.eval_memo srk alg
+  Formula.eval_cache srk alg
 
 type 'a gexpr = ('a, typ_fo) Syntax.expr
 let of_z3 context sym_of_decl expr =
@@ -344,10 +344,13 @@ let of_z3 context sym_of_decl expr =
 
 (* sym_of_decl is sufficient for round-tripping, since srk symbols become
    Z3 int symbols *)
+exception Unknown_symbol
 let sym_of_decl decl =
   let sym = Z3.FuncDecl.get_name decl in
-  assert (Z3.Symbol.is_int_symbol sym);
-  symbol_of_int (Z3.Symbol.get_int sym)
+  if not (Z3.Symbol.is_int_symbol sym) then
+    raise Unknown_symbol
+  else
+    symbol_of_int (Z3.Symbol.get_int sym)
 
 let term_of_z3 context term =
   match Expr.refine_coarse context (of_z3 context sym_of_decl term) with
@@ -506,6 +509,40 @@ module Solver = struct
   let get_reason_unknown solver = Z3.Solver.get_reason_unknown solver.s
 end
 
+module UnsatCoreSolver = struct
+  type 'a t = 'a solver
+
+  let add_l solver assertions =
+    let (assertions, (cores, core_assertions)) =
+      List.fold_left (fun (assertions, (cores, core_assertions)) (ass, b) ->
+        if b then
+          assertions, ((mk_const solver.srk (mk_symbol solver.srk `TyBool)) :: cores, ass :: core_assertions)
+        else
+          ass :: assertions, (cores, core_assertions)
+      ) ([], ([], [])) assertions
+    in
+    Z3.Solver.add solver.s (List.map solver.of_formula assertions);
+    Z3.Solver.assert_and_track_l solver.s (List.map solver.of_formula cores) (List.map solver.of_formula core_assertions)
+
+  let add solver ?(core = false) assertions =
+    add_l solver (List.map (fun ass -> (ass, core)) assertions)
+
+  let push = Solver.push
+  let pop = Solver.pop
+  let reset = Solver.reset
+
+  let check = Solver.check
+
+  let to_string = Solver.to_string
+
+  let get_model = Solver.get_model
+  let get_concrete_model = Solver.get_concrete_model
+
+  let get_unsat_core = Solver.get_unsat_core
+
+  let get_reason_unknown = Solver.get_reason_unknown
+end
+
 let optimize_box ?(context=Z3.mk_context []) srk phi objectives =
   let open Z3.Optimize in
   let z3 = context in
@@ -652,6 +689,7 @@ module CHC = struct
     let error_decl = decl_of_symbol context srk error in
     let params = Z3.Params.mk_params context in
     let sym x = Z3.Symbol.mk_string context x in
+    Z3.Params.add_symbol params (sym "engine") (sym "spacer");
     Z3.Params.add_bool params (sym "xform.slice") false;
     Z3.Params.add_bool params (sym "xform.inline_linear") false;
     Z3.Params.add_bool params (sym "xform.inline_eager") false;
@@ -748,16 +786,75 @@ module CHC = struct
       logf ~level:`warn "Caught Z3 exception: %s" x;
       `Unknown
 
-  let get_solution solver relation =
+  let get_solution solver =
     let srk = solver.srk in
-    let z3 = solver.z3 in
-    let decl = decl_of_symbol z3 srk relation in
-    if Symbol.Set.mem relation solver.head_relations then
-      match Z3.Fixedpoint.get_cover_delta solver.fp (-1) decl with
-      | Some inv -> formula_of_z3 srk inv
-      | None -> assert false
-    else
-      mk_false srk
+    let defs answer =
+      (* Answer should be a (possibly singleton) conjunction of definitions.
+         A definition is a (possibly nullary) universally quantified equation of the form
+         Forall V_0 ... V_N. (= (k!i V_0 ... V_n) (formula over V_0 ... V_n)) *)
+      let open Z3 in
+      let open Z3enums in
+      let rec def ans =
+        match AST.get_ast_kind (Expr.ast_of_expr ans) with
+        | APP_AST -> begin
+          let decl = Expr.get_func_decl ans in
+          let args = List.map (formula_of_z3 srk) (Expr.get_args ans) in
+          match FuncDecl.get_decl_kind decl, args with
+          | OP_EQ, [phi; psi] -> begin
+            match Formula.destruct srk phi with
+            | `Proposition (`App (rel, args)) ->
+              (* For some reason args are not indexed in the same order as they are applied,
+                 we must find the reverse mapping and apply this substitution to psi before returning *)
+              let args = List.mapi (fun i arg ->
+                  match destruct srk arg with
+                  | `Var (j, typ) -> (mk_var srk i (typ :> typ_fo), j)
+                  | _ -> assert false
+                ) args
+              in
+              let subst_map =
+                List.fold_left (fun map (arg, j) ->
+                  SrkUtil.Int.Map.add j arg map
+                ) SrkUtil.Int.Map.empty args
+              in
+              let psi = substitute srk (fun (i,_) -> SrkUtil.Int.Map.find i subst_map) psi in
+              (rel, psi)
+            | _ -> assert false
+            end
+          | _ -> assert false
+          end
+        | QUANTIFIER_AST ->
+          let ans = Z3.Quantifier.quantifier_of_expr ans in
+          assert (Z3.Quantifier.is_universal ans);
+          def (Z3.Quantifier.get_body ans)
+        | _ -> assert false
+      in
+      match AST.get_ast_kind (Expr.ast_of_expr answer) with
+      | APP_AST -> begin
+        let decl = Expr.get_func_decl answer in
+        match FuncDecl.get_decl_kind decl with
+        | OP_AND ->
+          List.fold_left (fun defs ans ->
+            try (def ans) :: defs
+            with Unknown_symbol -> defs
+          ) [] (Expr.get_args answer) (* definition for error and other relations *)
+        | _ -> [def answer] (* definition should be only defined for error (e.g. for empty systems) *)
+        end
+      | _ -> assert false
+    in
+    begin
+    match Z3.Fixedpoint.get_answer solver.fp with
+    | Some inv ->
+      let defs =
+        List.fold_left (fun dmap (rel, phi) ->
+          if (rel <> solver.error) then
+            Symbol.Map.add rel phi dmap
+          else
+            dmap
+        ) Symbol.Map.empty (defs inv)
+      in
+      (fun sym -> Symbol.Map.find_default (mk_false srk) sym defs)
+    | None -> assert false
+    end
 
   let to_string solver = Z3.Fixedpoint.to_string solver.fp
 end

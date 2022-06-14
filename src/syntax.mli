@@ -520,9 +520,10 @@ module Formula : sig
   val show : ?env:(string Env.t) -> 'a context -> 'a formula -> string
   val destruct : 'a context -> 'a formula -> ('a formula, 'a) open_formula
   val construct : 'a context -> ('a formula, 'a) open_formula -> 'a formula
+  val map_construct : 'a context -> ('b -> 'a formula) -> ('b, 'a) open_formula -> 'a formula
   val eval : 'a context -> (('b, 'a) open_formula -> 'b) -> 'a formula -> 'b
-  val eval_memo : 'a context -> (('b, 'a) open_formula -> 'b) -> 'a formula -> 
-    'b
+  val eval_memo : 'a context -> (('b, 'a) open_formula -> 'b) -> 'a formula -> 'b
+  val eval_cache : 'a context -> (('b, 'a) open_formula -> 'b) -> 'a formula -> 'b
   val existential_closure : 'a context -> 'a formula -> 'a formula
   val universal_closure : 'a context -> 'a formula -> 'a formula
   val skolemize_free : 'a context -> 'a formula -> 'a formula

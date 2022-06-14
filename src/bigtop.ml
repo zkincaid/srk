@@ -5,6 +5,8 @@ module Ctx = SrkAst.Ctx
 module Infix = Syntax.Infix(Ctx)
 let srk = Ctx.context
 
+let simsat_fine = ref false
+let simsat_forward = ref false
 let generator_rep = ref false
 
 let file_contents filename =
@@ -75,8 +77,30 @@ let spec_list = [
   ("-simsat",
    Arg.String (fun file ->
        let phi = load_formula file in
-       print_result (Quantifier.simsat srk phi)),
+       let simsat =
+         if (!simsat_fine) && (!simsat_forward) then (* fine and forward *)
+           Quantifier.FineGrainStrategyImprovement.simsat_forward
+         else if !simsat_fine then (* fine and not forward *)
+           Quantifier.FineGrainStrategyImprovement.simsat
+         else if !simsat_forward then (* coarse and forward *)
+           Quantifier.CoarseGrainStrategyImprovement.simsat_forward
+         else (* coarse and not forward *)
+           Quantifier.CoarseGrainStrategyImprovement.simsat
+       in
+       print_result (simsat srk phi)),
    " Test satisfiability of an LRA or LIA formula (IJCAI'16)");
+
+  ("-coarse",
+   Arg.Clear simsat_fine,
+   " Use coarse-grain semantics for SimSat");
+
+  ("-fine",
+   Arg.Set simsat_fine,
+   " Use fine-grain semantics for SimSat");
+
+  ("-forward",
+   Arg.Set simsat_forward,
+   " Use improved SimSat algorithm");
 
   ("-nlsat",
    Arg.String (fun file ->
@@ -165,6 +189,7 @@ let spec_list = [
    Arg.String (fun file ->
        let open Syntax in
        let phi = load_formula file in
+       let phi_mini = Quantifier.miniscope srk (eliminate_ite srk phi) in
        let phi = Formula.prenex srk phi in
        let constants = fold_constants Symbol.Set.add phi Symbol.Set.empty in
        let rec go phi =
@@ -178,9 +203,36 @@ let spec_list = [
             (List.map (fun _ -> "E") (Symbol.Set.elements constants)))
          ^ (go phi)
        in
-       Format.printf "Quantifier prefix: %s" qf_pre;
-       Format.printf "Variables: %d" (String.length qf_pre);
-       Format.printf "Matrix size: %d" (size phi)),
+       let qf_mini =
+         let rec go neg phi =
+           match Formula.destruct srk phi with
+           | `Quantify (`Exists, _, _, psi) -> (if neg then "A" else "E") ^ (go neg psi)
+           | `Quantify (`Forall, _, _, psi) -> (if neg then "E" else "A") ^ (go neg psi)
+           | `And phis | `Or phis ->
+             let qfs =
+               List.fold_left (fun qfs phi ->
+                 match qfs, go neg phi with
+                 | "", qf -> qf
+                 | qfs, "" -> qfs
+                 | qfs, qf -> qfs ^ "+" ^ qf
+               ) "" phis
+             in
+             if String.contains qfs '+' then
+               "(" ^ qfs ^ ")"
+             else
+               qfs
+           | `Not phi -> go (not neg) phi
+           | _ -> ""
+         in
+         (String.concat ""
+            (List.map (fun _ -> "E") (Symbol.Set.elements constants)))
+          ^ (go false phi_mini)
+       in
+       Format.printf "Quantifier prefix: %s\n" qf_pre;
+       Format.printf "Quantifier Miniscoped: %s\n" qf_mini;
+       Format.printf "Variables: %d\n" (String.length qf_pre);
+       Format.printf "Matrix size: %d\n" (size phi);
+       Format.printf "%a\n" (Syntax.Formula.pp srk) phi_mini),
    " Print formula statistics");
 
   ("-random",
@@ -260,7 +312,8 @@ let spec_list = [
 
 let usage_msg = "bigtop: command line interface to srk \n\
   Usage:\n\
-  \tbigtop [options] [-simsat|-nlsat] formula.smt2\n\
+  \tbigtop [options] [-coarse|-fine|-forward] -simsat formula.smt2\n\
+  \tbigtop [options] -nlsat formula.smt2\n\
   \tbigtop [-generator] -convex-hull formula.smt2\n\
   \tbigtop -affine-hull formula.smt2\n\
   \tbigtop -wedge-hull formula.smt2\n\

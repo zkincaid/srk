@@ -1225,6 +1225,22 @@ module Formula = struct
     | `Proposition (`App (f, args)) -> mk_app _srk f args
     | `Ite (cond, bthen, belse) -> mk_ite _srk cond bthen belse
 
+  let map_construct srk map open_formula = match open_formula with
+    | `Tru -> mk_true srk
+    | `Fls -> mk_false srk
+    | `And conjuncts -> mk_and srk (List.map map conjuncts)
+    | `Or disjuncts -> mk_or srk (List.map map disjuncts)
+    | `Not phi -> mk_not srk (map phi)
+    | `Quantify (`Exists, name, typ, phi) -> mk_exists srk ~name typ (map phi)
+    | `Quantify (`Forall, name, typ, phi) -> mk_forall srk ~name typ (map phi)
+    | `Atom (`Arith (`Eq, s, t)) -> mk_eq srk s t
+    | `Atom (`Arith (`Leq, s, t)) -> mk_leq srk s t
+    | `Atom (`Arith (`Lt, s, t)) -> mk_lt srk s t
+    | `Atom (`ArrEq (s, t)) -> mk_arr_eq srk s t
+    | `Proposition (`Var v) -> mk_var srk v `TyBool
+    | `Proposition (`App (f, args)) -> mk_app srk f args
+    | `Ite (cond, bthen, belse) -> mk_ite srk (map cond) (map bthen) (map belse)
+
   let rec eval srk alg phi = match destruct srk phi with
     | `Tru -> alg `Tru
     | `Fls -> alg `Fls
@@ -1260,6 +1276,22 @@ module Formula = struct
         result
     in
     go
+
+  let eval_cache srk alg =
+    Memo.lru_memo_recursive (fun go phi ->
+      match destruct srk phi with
+      | `Tru -> alg `Tru
+      | `Fls -> alg `Fls
+      | `Or disjuncts -> alg (`Or (List.map go disjuncts))
+      | `And conjuncts -> alg (`And (List.map go conjuncts))
+      | `Quantify (qt, name, typ, phi) ->
+        alg (`Quantify (qt, name, typ, go phi))
+      | `Not phi -> alg (`Not (go phi))
+      | `Atom c -> alg (`Atom c)
+      | `Proposition p -> alg (`Proposition p)
+      | `Ite (cond, bthen, belse) ->
+        alg (`Ite (go cond, go bthen, go belse))
+    )
 
   let pp = pp_expr
   let show ?(env=Env.empty) srk t = SrkUtil.mk_show (pp ~env srk) t
@@ -1374,35 +1406,42 @@ let mk_exists_const srk = quantify_const srk `Exists
 let mk_forall_const srk = quantify_const srk `Forall
 
 let quantify_consts srk qt p phi =
-  let nb_vars = ref 0 in
+  let subst_map = Hashtbl.create 97 in
   let varinfo = ref [] in
-  let subst =
-    Memo.memo (fun sym ->
-        if p sym then
-          mk_const srk sym
+  let nb_vars =
+    Symbol.Set.fold (fun sym nb ->
+        if p sym then nb
         else
-          let i = !nb_vars in
           let typ =
             match typ_symbol srk sym with
             | #typ_fo as x -> x
             | `TyFun _ ->
-               begin match qt with
-               | `Forall ->
+              begin match qt with
+                | `Forall ->
                   invalid_arg "mk_forall_consts: not a first-order constant"
-               | `Exists ->
+                | `Exists ->
                   invalid_arg "mk_exists_consts: not a first-order constant"
-               end
+              end
           in
-          incr nb_vars;
           varinfo := (show_symbol srk sym, typ)::(!varinfo);
-          mk_var srk i typ)
+          Hashtbl.add subst_map sym (mk_var srk nb typ);
+          nb + 1)
+      (symbols phi)
+      0
+  in
+  let phi_dec = decapture srk 0 nb_vars phi in
+  let subst sym =
+    BatHashtbl.find_default
+      subst_map
+      sym
+      (mk_const srk sym)
   in
   let quantify =
     match qt with
     | `Forall -> mk_forall srk
     | `Exists -> mk_exists srk
   in
-  let matrix = substitute_const srk subst phi in
+  let matrix = substitute_const srk subst phi_dec in
   List.fold_right
     (fun (name, typ) phi -> quantify ~name typ phi)
     (!varinfo)
