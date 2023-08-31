@@ -67,6 +67,17 @@ let roundtrip5 () =
   in
   assert_equal_formula formula (formula_of_z3 (z3_of_formula formula))
 
+let unsat_core1 () =
+  let asserts =
+    let open Infix in
+    [x = y; x < y]
+  in
+  let solver = Smt.mk_solver srk in
+  Smt.UnsatCoreSolver.add solver ~core:true asserts;
+  match Smt.UnsatCoreSolver.get_unsat_core  solver [] with
+  | `Unsat core -> List.iter2 assert_equal_formula asserts (List.rev core)
+  | _ -> assert false
+
 let is_interpolant phi psi itp =
   (Smt.entails srk phi itp = `Yes)
   && Smt.is_sat srk (mk_and srk [itp; psi]) = `Unsat
@@ -349,4 +360,5 @@ let suite = "SMT" >:::
     "chc3" >:: chc3;
     "chc_trivial_false" >:: chc_trivial_false;
     "chc_trivial_true" >:: chc_trivial_true;
+    "unsat_core1" >:: unsat_core1;
   ]
